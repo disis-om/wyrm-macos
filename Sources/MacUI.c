@@ -1,10 +1,38 @@
 #include "user.h"
 #include "network/server.h"
 #include "platform/android_home.h"
+#include <SDL3/SDL.h>
 #include <string.h>
+
+bool wyrm_mac_smoke_enabled, wyrm_mac_smoke_passed;
+static void smoke_tick(tenv* env) {
+  if (!wyrm_mac_smoke_enabled) return;
+  static unsigned ticks, frames;
+  ticks++;
+  if (ticks == 5) wyrm_mac_play("Mac engine check", "", true);
+  if (ticks == 10 || ticks == 11) {
+    SDL_Event event = {0};
+    event.type = ticks == 10 ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+    event.key.windowID = SDL_GetWindowID(env->wnd->handle);
+    event.key.scancode = SDL_SCANCODE_RETURN;
+    event.key.key = SDLK_RETURN;
+    event.key.down = ticks == 10;
+    SDL_PushEvent(&event);
+  }
+  if (env->usr->gdata.ai_mode && env->ctx->last_present_succeeded) frames++;
+  if (frames >= 120) {
+    int snakes = tdarray_length(env->usr->gdata.data.snakes);
+    wyrm_mac_smoke_passed = snakes > 0 && !env->usr->gdata.connection;
+    SDL_Log("WYRM_MAC_SMOKE_%s presented=%u snakes=%d socket=%p",
+            wyrm_mac_smoke_passed ? "OK" : "FAILED", frames, snakes,
+            (void*)env->usr->gdata.connection);
+    env->config.running = false;
+  }
+}
 
 /* Paper, dark ink, generous spacing: intentionally small engine-first launcher. */
 void wyrm_mac_ui(tenv* env) {
+  smoke_tick(env);
   tuser_data* user = env->usr;
   bool home = user->gdata.curr_screen == TITLE_SCREEN ||
               (user->gdata.curr_screen == LOBBY && user->gdata.conn == DISCONNECTED);
@@ -29,7 +57,10 @@ void wyrm_mac_ui(tenv* env) {
   igPushStyleColor_Vec4(ImGuiCol_ButtonActive, (ImVec4){.24f,.42f,.26f,1});
   igBegin("Wyrm for Mac", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
           ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+  igPushFont(user->imgui_data.body_font[0], 18);
+  igPushFont(user->imgui_data.display_font[1], 32);
   igTextUnformatted("W Y R M   /   M A C", NULL);
+  igPopFont();
   igSeparator();
   if (dead) {
     igTextUnformatted("One more round?", NULL);
@@ -38,7 +69,7 @@ void wyrm_mac_ui(tenv* env) {
     if (igButton("Back to arenas", (ImVec2){width - 64, 40})) wyrm_mac_death(true);
   } else if (connecting || (!home && user->gdata.conn != DISCONNECTED)) {
     igTextUnformatted("Entering arena...", NULL);
-    igTextWrapped("Press Q to leave the arena and choose again.");
+    igTextWrapped("Press Escape to cancel and choose again.");
   } else {
     static char name[MAX_NICKNAME_LEN + 1] = "Wyrm";
     static char arena[MAX_ARENA_LEN + 1] = "";
@@ -75,6 +106,7 @@ void wyrm_mac_ui(tenv* env) {
       wyrm_mac_play(name[0] ? name : "Wyrm", "", true);
     igTextWrapped("Mouse to steer  /  Click or Space to boost\nP assist  /  Q leave  /  F11 fullscreen");
   }
+  igPopFont();
   igEnd();
   igPopStyleColor(6);
   igPopStyleVar(5);

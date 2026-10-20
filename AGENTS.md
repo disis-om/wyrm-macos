@@ -17,7 +17,8 @@ Read ../CLAUDE.md and the workspace Desk first. Owner: OM Rajput.
 
 ## Current state
 
-2026-10-20: initial native host and universal cloud build in progress. Physical
+2026-10-20: public repo disis-om/wyrm-macos created and pushed. Initial universal
+compile reached the host; missing SDL_main declaration fixed. Cloud verification in progress. Physical
 launch, online join, sustained play and Hackintosh drivers remain unverified.
 
 ## Log

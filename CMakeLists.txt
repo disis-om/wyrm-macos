@@ -31,6 +31,7 @@ target_include_directories(Wyrm PRIVATE "${CMAKE_BINARY_DIR}/include")
 target_compile_options(Wyrm PRIVATE -include "${CMAKE_SOURCE_DIR}/Sources/MacCompat.h"
   -Wno-unused-parameter -Wno-unused-function -Wno-unused-variable
   -Wno-missing-braces -Wno-sign-compare -Wno-deprecated-declarations
+  -Wno-nullability-completeness
   "$<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>" "$<$<CONFIG:Release>:-O3>")
 target_link_libraries(Wyrm PRIVATE "${SDL_FRAMEWORK}" "${MVK_LIBRARY}"
   "-framework AppKit" "-framework Foundation" "-framework Metal"

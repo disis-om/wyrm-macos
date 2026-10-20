@@ -38,5 +38,9 @@ Android, bounded to 128 KiB, 2048 rows. No game-port probing or packet changes.
 Pinned, hash-checked SDL3 3.4.16 and MoltenVK 1.4.2 Apple frameworks. CMake builds
 a universal macOS 12 app; CI validates both Mach-O slices, dependent frameworks,
 bundle layout and ad-hoc signatures, then uploads a zipped development artifact.
+An offline-only `--smoke-ai` check opens the actual engine, dismisses the practice
+notice through an SDL Enter event, and requires 120 presented AI frames, snakes
+and no network socket. Hosted graphics failures are retained as separate evidence;
+they do not turn a successful compile into a false gameplay claim.
 No Apple signing secrets or backend credentials are required. CI is build proof;
 Intel and Apple Silicon physical gameplay are separate pending verification.

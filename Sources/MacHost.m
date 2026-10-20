@@ -1,7 +1,10 @@
 #import <AppKit/AppKit.h>
 #include <SDL3/SDL.h>
 #include <unistd.h>
+#include <ctype.h>
+#include <SDL3/SDL_main.h>
 #include "MacCompat.h"
+extern bool wyrm_mac_smoke_enabled, wyrm_mac_smoke_passed;
 
 static char sessionPath[PATH_MAX];
 static char files[3][PATH_MAX];
@@ -93,10 +96,13 @@ int main(int argc, char** argv) {
     snprintf(files[1], PATH_MAX, "%s/user.dat.tmp", sessionPath);
     snprintf(files[2], PATH_MAX, "%s/user.dat.bak", sessionPath);
     SDL_SetMainReady();
-    wyrm_mac_refresh_directory();
+    for (int n = 1; n < argc; n++)
+      if (!strcmp(argv[n], "--smoke-ai")) wyrm_mac_smoke_enabled = true;
+    if (!wyrm_mac_smoke_enabled) wyrm_mac_refresh_directory();
     int result = wyrm_engine_main(argc, argv);
     SDL_Quit();
     [NSFileManager.defaultManager removeItemAtPath:@(sessionPath) error:nil];
+    if (wyrm_mac_smoke_enabled) return result ? result : wyrm_mac_smoke_passed ? 0 : 2;
     if (result) {
       NSAlert* alert = [[NSAlert alloc] init];
       alert.messageText = @"Wyrm couldn't start the engine";

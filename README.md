@@ -4,6 +4,9 @@ First engine bring-up for OM Rajput. Universal native application for Intel
 and Apple Silicon, targeting macOS 12 Monterey and later. Uses the exact C
 engine compiled by Wyrm Desktop, SDL3 and Vulkan through MoltenVK.
 
+Public source: https://github.com/disis-om/wyrm-macos. Cloud builds use standard
+hosted Mac runners; no paid larger runners or signing services are configured.
+
 This prototype provides a live arena directory, custom endpoint, player name,
 Play and offline AI. Mouse steers; click/Space boosts, P toggles assist,
 Q leaves, F11 toggles fullscreen. Home/Play again remain available after death.

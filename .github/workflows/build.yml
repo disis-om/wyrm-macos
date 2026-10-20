@@ -22,18 +22,22 @@ jobs:
         run: cmake --build build --parallel 3
       - name: Verify and package
         run: bash Scripts/package.sh
-      - name: Hosted Mac offline AI smoke
-        id: smoke
-        continue-on-error: true
-        run: python3 Scripts/smoke.py
       - uses: actions/upload-artifact@v4
         with:
           name: Wyrm-macOS-universal
           path: dist/
           retention-days: 30
-  apple-silicon:
+  native-smoke:
     needs: universal
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            chip: Intel
+          - runner: macos-15
+            chip: Apple-Silicon
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
@@ -45,12 +49,11 @@ jobs:
         run: |
           mkdir -p build
           ditto -x -k downloaded/Wyrm-macOS-universal.zip build
-          lipo build/Wyrm.app/Contents/MacOS/Wyrm -verify_arch arm64
-      - name: Hosted Apple Silicon offline AI smoke
-        continue-on-error: true
+      - name: Hosted offline AI smoke
         run: python3 Scripts/smoke.py
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: Wyrm-Apple-Silicon-smoke
+          name: Wyrm-${{ matrix.chip }}-smoke
           path: dist/
           retention-days: 30

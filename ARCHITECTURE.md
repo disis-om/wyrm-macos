@@ -15,6 +15,11 @@ disabled. Portability extensions are enabled when advertised, using the proven
 iOS Apple Vulkan adapter. Desktop mouse/keyboard semantics stay selected.
 Focus loss releases the native held-key map and pointer state, so switching
 away cannot leave boost or a turn held down.
+Metal argument buffers are disabled before the first Vulkan call. This engine
+uses small ordinary descriptor sets; MoltenVK 1.4.2's argument-encoder sizing
+probe aborts in `MTLIOAccelDevice newIndirectArgumentEncoderWithLayout:` on the
+hosted Intel Metal 2 driver. Native smoke tests run as separate, failing jobs
+on both architectures; compile success cannot hide a runtime failure.
 The macOS launcher draws with the engine's existing Dear ImGui and packaged
 Wyrm fonts: restrained paper/ink composition, green Play accent, no web view.
 Play posts into the engine's bounded home mailbox. No game objects cross threads.
@@ -42,8 +47,8 @@ a universal macOS 12 app; CI validates both Mach-O slices, dependent frameworks,
 bundle layout and ad-hoc signatures, then uploads a zipped development artifact.
 An offline-only `--smoke-ai` check opens the actual engine, dismisses the practice
 notice through an SDL Enter event, and requires 120 presented AI frames, snakes
-and no network socket. Hosted graphics failures are retained as separate evidence;
-they do not turn a successful compile into a false gameplay claim.
+and no network socket. Hosted graphics failures are retained as separate evidence
+and fail their native smoke job without discarding the compiled artifact.
 The packaged app is also opened on a standard Apple Silicon runner. Both hosts
 retain separate smoke logs; the universal binary and bundled SDL framework have
 their real Mach-O architecture slices and minimum macOS versions inspected.

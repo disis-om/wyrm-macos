@@ -37,7 +37,7 @@ target_link_libraries(Wyrm PRIVATE "${SDL_FRAMEWORK}" "${MVK_LIBRARY}"
   "-framework AppKit" "-framework Foundation" "-framework Metal"
   "-framework QuartzCore" "-framework IOSurface" "-framework IOKit" "-framework CoreVideo" c++)
 # SDL discovers the statically linked Vulkan entrypoint via dlsym.
-target_link_options(Wyrm PRIVATE -Wl,-export_dynamic -Wl,-u,_vkGetInstanceProcAddr)
+target_link_options(Wyrm PRIVATE -ObjC -Wl,-export_dynamic -Wl,-u,_vkGetInstanceProcAddr)
 set_target_properties(Wyrm PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/Sources/Info.plist"
   BUILD_RPATH "@executable_path/../Frameworks" INSTALL_RPATH "@executable_path/../Frameworks"
   BUILD_WITH_INSTALL_RPATH TRUE)

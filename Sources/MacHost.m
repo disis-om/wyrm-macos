@@ -88,6 +88,9 @@ int main(int argc, char** argv) {
     [NSFileManager.defaultManager createDirectoryAtPath:logs withIntermediateDirectories:YES attributes:nil error:nil];
     freopen([[logs stringByAppendingPathComponent:@"engine.log"] fileSystemRepresentation], "w", stderr);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    /* This engine uses five ordinary bindings, not bindless resources. Metal 2
+       virtual Intel drivers abort inside MoltenVK's argument-encoder probe. */
+    setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 1);
     NSString* resources = NSBundle.mainBundle.resourcePath;
     if (!resources || chdir(resources.fileSystemRepresentation)) return 1;
     snprintf(sessionPath, sizeof(sessionPath), "%sWyrm-engine-XXXXXX", NSTemporaryDirectory().fileSystemRepresentation);

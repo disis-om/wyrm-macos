@@ -19,7 +19,10 @@ Read ../CLAUDE.md and the workspace Desk first. Owner: OM Rajput.
 
 2026-10-20: public repo disis-om/wyrm-macos created and pushed. Initial universal
 compile completed for both architectures after fixing the SDL_main declaration.
-Packaging/runtime checks in progress; focus release and bundle inspection added. Physical
+Bundle/signature/minimum-OS checks passed. Apple Silicon completed 120 presented
+offline AI frames. Intel hit a MoltenVK argument-encoder probe abort; compatible
+ordinary binding mode is under verification. Native test failures now fail CI.
+Physical
 launch, online join, sustained play and Hackintosh drivers remain unverified.
 
 ## Log

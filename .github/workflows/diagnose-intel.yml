@@ -26,7 +26,22 @@ jobs:
           mkdir -p build
           ditto -x -k downloaded/Wyrm-macOS-universal.zip build
       - name: Diagnose startup
+        continue-on-error: true
         run: python3 Scripts/smoke.py
+      - name: Capture abort backtrace
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+          with Path('dist/lldb.log').open('w') as output:
+              try:
+                  subprocess.run(['lldb', '--batch', '-o', 'run', '-o', 'thread backtrace all', '--',
+                                  'build/Wyrm.app/Contents/MacOS/Wyrm', '--smoke-ai'],
+                                 stdout=output, stderr=subprocess.STDOUT, timeout=90)
+              except subprocess.TimeoutExpired:
+                  output.write('Debugger timed out.\n')
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:

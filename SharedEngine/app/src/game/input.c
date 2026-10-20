@@ -1,0 +1,525 @@
+#include "input.h"
+
+#include <math.h>
+#include <string.h>
+
+#include "../mobile/mobile_controls.h"
+#include "../mobile/mobile_hotkeys.h"
+#include "../network/server.h"
+#include "../network/arena_protocol.h"
+#include "../platform/rain_bridge.h"
+#include "oef.h"
+#include "../user.h"
+
+/*
+ * Eyes Back (OM, 2026-10-06): NTL VANCED's NTL_EB, ported line for line.
+ *
+ * While it is on, the one heading byte Wyrm already sends is replaced by
+ * "straight behind the head, a few steps to one side", alternating sides:
+ * the manual left-right eye flick, automated. The server turns a snake
+ * toward the last heading it heard at a fixed rate, so a byte just short of
+ * 180 degrees on one side turns it that way; the share of left and right
+ * bytes (a sigma-delta duty cycle) steers toward where the player aims.
+ * Every client draws a snake's eyes toward what it last sent, so everyone
+ * sees the eyes looking back. Same one-byte packet, same 33 ms cadence:
+ * nothing new goes on the wire.
+ *
+ * The server heading is predicted as the server computes it: a command lands
+ * rtt/2 after it is sent and turns the snake toward its angle at
+ * mamu * scang * spang per 8 ms. Every heading the server reports re-anchors
+ * the model; the gap between report and prediction widens the margin so ping
+ * jitter cannot flip a side. NTL's numbers: 8 steps (of 251) from straight
+ * back, +4 while turning hard, an adaptive part of at most 22, re-anchor past
+ * 0.55 rad, a 2.5-tick band.
+ */
+#define EB_EPS 8.0f
+#define EB_TURN_MARGIN 4.0f
+#define EB_EPS_MAX 22.0f
+#define EB_SNAP 0.55f
+#define EB_BAND 2.5f
+#define EB_LOG_MAX 160
+
+typedef struct eb_cmd {
+  float te; /* when it reaches the server, client clock (ms) */
+  float w;  /* the angle sent (rad) */
+  float r;  /* the snake's turn rate then (rad/ms) */
+} eb_cmd;
+
+static struct {
+  bool on;
+  float err;
+  float last_t;
+  bool anchored;
+  float anchor_t;
+  float anchor_a;
+  eb_cmd log[EB_LOG_MAX];
+  int log_n;
+  float res_max;
+  bool holding;
+  float hold;
+  bool seen;
+  float last_seen;
+  const void* conn; /* the socket and snake the model belongs to */
+  int snake_id;
+  bool sent;
+  float sent_ang; /* the last byte sent, in radians: where the eyes look */
+  float rtt;
+} eb = {.rtt = 100.0f, .snake_id = -1};
+
+static float eb_norm(float a) {
+  a = fmodf(a, PI2);
+  if (a > PI)
+    a -= PI2;
+  else if (a < -PI)
+    a += PI2;
+  return a;
+}
+
+static void eb_reset(void) {
+  bool on = eb.on;
+  memset(&eb, 0, sizeof(eb));
+  eb.on = on;
+  eb.rtt = 100.0f;
+  eb.snake_id = -1;
+}
+
+static float eb_turn(float a, float w, float r, float ms) {
+  float d = eb_norm(w - a), mx = r * ms;
+  return a + (d > mx ? mx : d < -mx ? -mx : d);
+}
+
+/* The server's heading at client time tau: replay every command in effect
+   from the anchor, each turning toward its angle at full rate. */
+static float eb_heading_at(float tau) {
+  float a = eb.anchor_a, t = eb.anchor_t;
+  const eb_cmd* cmd = NULL;
+  int i = 0;
+  for (; i < eb.log_n && eb.log[i].te <= t; i++) cmd = &eb.log[i];
+  for (; i < eb.log_n && eb.log[i].te < tau; i++) {
+    if (cmd) a = eb_turn(a, cmd->w, cmd->r, eb.log[i].te - t);
+    t = eb.log[i].te;
+    cmd = &eb.log[i];
+  }
+  return cmd ? eb_turn(a, cmd->w, cmd->r, tau - t) : a;
+}
+
+/* A heading from the server, seen at client time now (it describes the
+   server about rtt/2 earlier): measure the model's error, then re-anchor. */
+static void eb_sample(float v, float now) {
+  float tau = now - eb.rtt / 2.0f;
+  if (eb.anchored) {
+    float res = fabsf(eb_norm(v - eb_heading_at(tau)));
+    eb.res_max = fmaxf(res, eb.res_max * 0.92f);
+    if (res > EB_SNAP) eb.log_n = 0; /* the model diverged: drop its turns */
+  }
+  eb.anchored = true;
+  eb.anchor_t = tau;
+  eb.anchor_a = v;
+}
+
+static void eb_log_drop_first(void) {
+  memmove(eb.log, eb.log + 1, sizeof(eb_cmd) * (size_t)(eb.log_n - 1));
+  eb.log_n--;
+}
+
+/* One send tick (about every 33 ms). Returns the 0-250 byte to send. */
+static int eb_tick(bool aiming, float target, const snake* s, float now,
+                   float rtt, float mamu) {
+  eb.rtt = rtt;
+  if (!eb.anchored) {
+    eb_sample(s->ang, now);
+    eb.seen = true;
+    eb.last_seen = s->ang;
+  }
+  float dt = eb.last_t != 0.0f ? now - eb.last_t : 33.0f;
+  eb.last_t = now;
+  if (dt > 200.0f) dt = 200.0f;
+  float te = now + rtt / 2.0f; /* when this byte reaches the server */
+  float r = mamu * s->scang * s->spang / 8.0f; /* rad per ms */
+  if (r < 1e-6f) r = 1e-6f;
+  float est = eb_heading_at(te); /* the server heading when it lands */
+  if (!aiming) {                 /* finger on the head: keep the heading */
+    if (!eb.holding) {
+      eb.holding = true;
+      eb.hold = est;
+    }
+    target = eb.hold;
+  } else
+    eb.holding = false;
+  float d = eb_norm(target - est);
+  float k = d / (r * dt * EB_BAND);
+  if (k > 1.0f)
+    k = 1.0f;
+  else if (k < -1.0f)
+    k = -1.0f;
+  eb.err += (1.0f + k) / 2.0f;
+  bool plus = eb.err >= 1.0f;
+  if (plus) eb.err -= 1.0f;
+  float eps = EB_EPS + fabsf(k) * EB_TURN_MARGIN +
+              fminf(EB_EPS_MAX, 1.3f * eb.res_max * 251.0f / PI2);
+  float base = 251.0f * fmodf(fmodf(est + PI, PI2) + PI2, PI2) / PI2;
+  int b = (int)floorf((plus ? base - eps : base + eps) + 0.5f);
+  b = ((b % 251) + 251) % 251;
+  if (eb.log_n == EB_LOG_MAX) eb_log_drop_first();
+  eb.log[eb.log_n++] = (eb_cmd){te, b * PI2 / 251.0f, r};
+  while (eb.log_n > 1 && eb.log[1].te < now - 2000.0f) eb_log_drop_first();
+  return b;
+}
+
+static void eb_send(game_data* gdata, struct mg_connection* connection,
+                    const snake* me, int xm, int ym) {
+  if (eb.conn != (const void*)connection || eb.snake_id != me->id) {
+    eb_reset();
+    eb.conn = connection;
+    eb.snake_id = me->id;
+  }
+  if (!(gdata->data.ctm - gdata->data.last_e_mtm > ARENA_EYES_BACK_MS)) return;
+  gdata->data.last_e_mtm = gdata->data.ctm;
+  gdata->data.lsxm = xm;
+  gdata->data.lsym = ym;
+  float d2 = (float)xm * xm + (float)ym * ym;
+  float rtt = gdata->data.ping > 0 ? (float)gdata->data.ping : 100.0f;
+  if (rtt > 600.0f) rtt = 600.0f;
+  int sang = eb_tick(d2 > 256.0f, atan2f((float)ym, (float)xm), me,
+                     gdata->data.ctm, rtt, gdata->data.mamu);
+  eb.sent = true;
+  eb.sent_ang = sang * PI2 / 251.0f;
+  if (sang != gdata->data.lsang) {
+    gdata->data.lsang = sang;
+    arena_send(connection, (uint8_t[]){sang & 255}, 1);
+  }
+}
+
+/*
+ * Eyes Back locked arenas (OM, 2026-10-13, as NTL VANCED): arenas that ban
+ * players for Eyes Back. There it never runs, and the player is told for 5 s
+ * at the top of the screen (ui_overlay.c, eyes_back_lock_message).
+ */
+static const char* const EB_LOCKED_ARENAS[] = {"139.84.170.60:444"};
+#define EB_LOCK_MESSAGE_MS 5000
+static Uint64 eb_lock_until;
+
+static bool eyes_back_locked_here(const user_settings* usrs) {
+  const char* arena = user_settings_arena(usrs);
+  if (!arena || !arena[0]) return false;
+  for (size_t i = 0; i < sizeof(EB_LOCKED_ARENAS) / sizeof(*EB_LOCKED_ARENAS);
+       i++) {
+    const char* a = arena;
+    const char* b = EB_LOCKED_ARENAS[i];
+    while (*a && *b &&
+           (*a == *b || (*a >= 'A' && *a <= 'Z' && *a + 32 == *b))) {
+      a++;
+      b++;
+    }
+    if (!*a && !*b) return true;
+  }
+  return false;
+}
+
+static void eyes_back_say_locked(void) {
+  eb_lock_until = SDL_GetTicks() + EB_LOCK_MESSAGE_MS;
+}
+
+/* The message while it shows, else NULL. */
+const char* eyes_back_lock_message(void) {
+  if (eb_lock_until == 0 || SDL_GetTicks() >= eb_lock_until) return NULL;
+  return "Eyes Back is disabled in this arena, so this server does not ban you";
+}
+
+static void eyes_back_toggle(game_data* gdata, const user_settings* usrs) {
+  if (!eb.on && eyes_back_locked_here(usrs)) {
+    eyes_back_say_locked();
+    return;
+  }
+  eb.on = !eb.on;
+  eb_reset();
+  /* Off: the real heading goes out on the next tick even if the stick has
+     not moved, or the snake would keep turning toward the last back byte. */
+  if (!eb.on) {
+    gdata->data.want_e = true;
+    gdata->data.lsang = -1;
+  }
+}
+
+bool eyes_back_active(void) { return eb.on; }
+
+bool eyes_back_eye_angle(float* out) {
+  if (!eb.on || !eb.sent) return false;
+  *out = eb.sent_ang;
+  return true;
+}
+
+/* Every heading the server reports for your own snake (callback.c). */
+void eyes_back_heading(float ang, float now) {
+  if (!eb.on || !eb.anchored) return;
+  if (eb.seen && ang == eb.last_seen) return;
+  eb.seen = true;
+  eb.last_seen = ang;
+  eb_sample(ang, now);
+}
+
+static void input_with_policy(tenv* env, bool team_protected,
+                              bool force_heading) {
+  tuser_data* usr = env->usr;
+  tcontext* ctx = env->ctx;
+  game_data* gdata = &usr->gdata;
+  user_settings* usrs = &usr->usrs;
+  struct mg_connection* connection = gdata->connection;
+
+  /* Every send below goes down this socket, and a match can end inside the
+     same frame that reads the controls — the poll that delivers the close runs
+     after this. There is nothing useful to send to an arena that has already
+     hung up, and sending it is what turns a finished match into a crash. */
+  if (!connection || !gdata->arena_ready || connection->is_closing) return;
+
+  /*
+   * One ping outstanding at a time, and never faster than one per 250ms.
+   *
+   * Slither.txt: `if(!wfpr)if(ctm-last_ping_mtm>250)`. Wyrm used to abandon
+   * `wfpr` after 500ms; that let it ping faster than any real client, which
+   * is its own way of being asked to leave. A late reply is marked at 750ms
+   * in `oef`; a dead socket is the silence watchdog in `loop.c`.
+   */
+  if (!gdata->data.wfpr) {
+    if (gdata->data.ctm - gdata->data.last_ping_mtm > ARENA_PING_MS) {
+      gdata->data.last_ping_mtm = gdata->data.ctm;
+      gdata->data.wfpr = true;
+      ping_mark_sent(env);
+      arena_send(connection, (uint8_t[]){gdata->data.protocol_version >= 5 ? 251 : 112}, 1);
+    }
+  }
+
+  /* Following a snake that has already been taken off the list is the same
+     read one element before the array that crashed got_packet — the window is
+     small, between the snake leaving and the death packet arriving, but it is
+     a window a player sits in every time they die. */
+  if (gdata->data.follow_view && tdarray_length(gdata->data.snakes) > 0) {
+    int xm;
+    int ym;
+
+    int snakes_len = tdarray_length(gdata->data.snakes);
+    snake* me = gdata->data.snakes + (snakes_len - 1);
+
+    if (usrs->hotkeys[HOTKEY_BOT].active) {
+      xm = gdata->bot.output.xm;
+      ym = gdata->bot.output.ym;
+    } else if (!team_protected) {
+      if (twindow_key_down(
+              env->wnd, mobile_hotkey_get_key(usrs, MOBILE_HOTKEY_TURN_LEFT)) ||
+          mobile_hotkeys_down(env, MOBILE_HOTKEY_TURN_LEFT))
+        gdata->data.kd_l_frb += gdata->data.vfrb;
+      if (twindow_key_down(env->wnd, mobile_hotkey_get_key(
+                                         usrs, MOBILE_HOTKEY_TURN_RIGHT)) ||
+          mobile_hotkeys_down(env, MOBILE_HOTKEY_TURN_RIGHT))
+        gdata->data.kd_r_frb += gdata->data.vfrb;
+
+      if (gdata->data.kd_l_frb > 0 || gdata->data.kd_r_frb > 0)
+        if (gdata->data.ctm - gdata->data.lkstm > ARENA_TURN_MS) {
+          gdata->data.lkstm = gdata->data.ctm;
+          if (gdata->data.kd_r_frb > 0)
+            if (gdata->data.kd_l_frb > gdata->data.kd_r_frb) {
+              gdata->data.kd_l_frb -= gdata->data.kd_r_frb;
+              gdata->data.kd_r_frb = 0;
+            }
+          if (gdata->data.kd_l_frb > 0)
+            if (gdata->data.kd_r_frb > gdata->data.kd_l_frb) {
+              gdata->data.kd_r_frb -= gdata->data.kd_l_frb;
+              gdata->data.kd_l_frb = 0;
+            }
+          if (gdata->data.kd_l_frb > 0) {
+            int v = gdata->data.kd_l_frb;
+            if (v > 127) v = 127;
+            gdata->data.kd_l_frb -= v;
+            me->eang -= gdata->data.mamu * v * me->scang * me->spang;
+            arena_send(connection, (uint8_t[]){gdata->data.protocol_version >= 5 ? 252 : 108, (uint8_t)v}, 2);
+          } else if (gdata->data.kd_r_frb > 0) {
+            int v = gdata->data.kd_r_frb;
+            if (v > 127) v = 127;
+            gdata->data.kd_r_frb -= v;
+            me->eang += gdata->data.mamu * v * me->scang * me->spang;
+            if (gdata->data.protocol_version >= 5) v += 128;
+            arena_send(connection, (uint8_t[]){gdata->data.protocol_version >= 5 ? 252 : 114, (uint8_t)v}, 2);
+          }
+        }
+
+      if (!mobile_controls_get_aim(env, &xm, &ym)) {
+        xm = (int)env->ms->pos[0] - ctx->size[0] / 2;
+        ym = (int)env->ms->pos[1] - ctx->size[1] / 2;
+      }
+    } else {
+      // The Team panel owns all manual input. If bot protection is disabled,
+      // keep the last heading instead of leaking chat/touch input into arena
+      // controls while the panel is open.
+      xm = gdata->data.lsxm;
+      ym = gdata->data.lsym;
+    }
+    // SDL turns Android touches into compatibility mouse events so ImGui stays
+    // touchable. Never treat that synthetic left mouse as gameplay boost: the
+    // mobile controls layer owns boost using an explicit finger ID.
+#ifdef WYRM_SDL_JNI
+    gdata->data.wmd =
+        team_protected
+            ? (usrs->hotkeys[HOTKEY_BOT].active && gdata->bot.output.accel)
+            : (twindow_key_down(env->wnd, mobile_hotkey_get_key(
+                                              usrs, MOBILE_HOTKEY_BOOST)) ||
+#else
+    gdata->data.wmd =
+        team_protected
+            ? (usrs->hotkeys[HOTKEY_BOT].active && gdata->bot.output.accel)
+            : (twindow_button_down(env->wnd, GLFW_MOUSE_BUTTON_LEFT) ||
+               twindow_key_down(env->wnd, mobile_hotkey_get_key(
+                                              usrs, MOBILE_HOTKEY_BOOST)) ||
+#endif
+#ifdef WYRM_DESKTOP
+               /* The Boost key, and W / Up while no action took them. */
+               mobile_hotkeys_desktop_boost_down(env) ||
+#else
+               twindow_key_down(env->wnd, GLFW_KEY_UP) ||
+#endif
+               mobile_controls_boost_down(env) ||
+               mobile_hotkeys_down(env, MOBILE_HOTKEY_BOOST) ||
+               gdata->bot.output.accel);
+
+    if (gdata->data.md != gdata->data.wmd &&
+        gdata->data.ctm - gdata->data.last_accel_mtm > ARENA_BOOST_MS) {
+      gdata->data.md = gdata->data.wmd;
+      gdata->data.last_accel_mtm = gdata->data.ctm;
+      if (gdata->data.protocol_version >= 5)
+        arena_send(connection, (uint8_t[]){gdata->data.md ? 253 : 254}, 1);
+      else
+        arena_send(connection, (uint8_t[]){109, gdata->data.md ? 1 : 0}, 2);
+    }
+
+    /* A newly admitted snake has not sent a direction on this socket yet.
+
+     * Protected input normally holds the last vector still, so its (0, 0)
+
+     * compares equal to the reset vector and suppresses the packet entirely.
+
+     * Some arenas accept a ping-only join; others close that silent snake.
+ The
+     * join path forces this first comparison, while lsang keeps every
+ later
+     * frame deduplicated in the ordinary way. */
+    if (force_heading || xm != gdata->data.lsxm || ym != gdata->data.lsym)
+      gdata->data.want_e = true;
+    me->eang = atan2f(ym, xm);
+    /* Eyes Back (OM, 2026-10-06) owns the heading byte while it is on. */
+    /* A locked arena turns it off, and says why (OM, 2026-10-13). */
+    if (eb.on && eyes_back_locked_here(usrs)) {
+      eyes_back_toggle(gdata, usrs);
+      eyes_back_say_locked();
+    }
+    bool rain_rotating = wyrm_rain_rotating();
+    bool eyes_back = eb.on && gdata->data.protocol_version >= 5 && !rain_rotating;
+    if (eyes_back) eb_send(gdata, connection, me, xm, ym);
+    float ang;
+    if (!eyes_back && !rain_rotating && gdata->data.want_e &&
+        gdata->data.ctm - gdata->data.last_e_mtm > ARENA_AIM_MS) {
+      gdata->data.want_e = false;
+      gdata->data.last_e_mtm = gdata->data.ctm;
+      gdata->data.lsxm = xm;
+      gdata->data.lsym = ym;
+      float d2 = xm * xm + ym * ym;
+      if (d2 > 256) {
+        ang = atan2f(ym, xm);
+        me->eang = ang;
+      } else
+        ang = me->wang;
+      ang = fmodf(ang, PI2);
+      if (ang < 0) ang += PI2;
+      int sang = (int)floorf((gdata->data.protocol_version >= 5 ? 251 : 16777215) * ang / PI2);
+      if (sang != gdata->data.lsang) {
+        gdata->data.lsang = sang;
+        if (gdata->data.protocol_version >= 5)
+          arena_send(connection, (uint8_t[]){sang & 255}, 1);
+        else
+          arena_send(connection, (uint8_t[]){101, (sang >> 16) & 255,
+                                           (sang >> 8) & 255, sang & 255}, 4);
+      }
+    }
+  }
+
+  // Bot aim/acceleration and network packets above must continue while Team
+  // Mode owns the UI. Everything below is manual zoom/hotkey processing and
+  // remains blocked so chat text can never toggle gameplay state.
+  if (team_protected) return;
+
+  gdata->data.ms_zoom *= expf(env->ms->dwheel * usrs->zoom_step);
+
+  if (tkeyboard_key_pressed(
+          env->kb, mobile_hotkey_get_key(usrs, MOBILE_HOTKEY_ZOOM_IN)) ||
+      mobile_hotkeys_pressed(env, MOBILE_HOTKEY_ZOOM_IN))
+    gdata->data.ms_zoom *= expf(1 * usrs->zoom_step);
+  else if (tkeyboard_key_pressed(
+               env->kb, mobile_hotkey_get_key(usrs, MOBILE_HOTKEY_ZOOM_OUT)) ||
+           mobile_hotkeys_pressed(env, MOBILE_HOTKEY_ZOOM_OUT))
+    gdata->data.ms_zoom *= expf(-1 * usrs->zoom_step);
+
+  gdata->data.ms_zoom =
+      GLM_MAX(MAX_ZOOM_OUT, GLM_MIN(gdata->data.ms_zoom, MAX_ZOOM_IN));
+
+  // hotkeys
+  for (int i = 0; i < NUM_HOTKEYS; i++) {
+    hotkey* hk = usrs->hotkeys + i;
+    bool virtual_pressed = mobile_hotkeys_pressed(env, i);
+    if (i == HOTKEY_RESTART || i == HOTKEY_QUIT)
+      hk->active = tkeyboard_key_pressed(env->kb, hk->key) || virtual_pressed;
+    else if (hk->mode)
+      hk->active =
+          twindow_key_down(env->wnd, hk->key) || mobile_hotkeys_down(env, i);
+    else
+      hk->active ^= tkeyboard_key_pressed(env->kb, hk->key) || virtual_pressed;
+  }
+
+  if (WYRM_EXPERIMENTAL_ROPE_MODE &&
+      (tkeyboard_key_pressed(
+           env->kb, mobile_hotkey_get_key(usrs, MOBILE_HOTKEY_ROPE_MODE)) ||
+       mobile_hotkeys_pressed(env, MOBILE_HOTKEY_ROPE_MODE)))
+    env->usr->mobile_hotkeys.rope_mode = !env->usr->mobile_hotkeys.rope_mode;
+
+  /* Auto restart (OM, 2026-10-05): the on-screen toggle in the rope-mode slot.
+     On, a kill is answered with Restart at once (android_home_notify_death).
+     Kept in `auto_respawn`, which user.dat already holds. */
+  if (!WYRM_EXPERIMENTAL_ROPE_MODE &&
+      mobile_hotkeys_pressed(env, MOBILE_HOTKEY_ROPE_MODE)) {
+    usrs->auto_respawn = usrs->auto_respawn ? 0 : 1;
+    save_user_settings(usrs);
+  }
+
+  /* Eyes Back (OM, 2026-10-06): the on-screen key turns it on and off. It
+     stays on through deaths for the session, as NTL VANCED's does. */
+  if (mobile_hotkeys_pressed(env, MOBILE_HOTKEY_EYES_BACK))
+    eyes_back_toggle(gdata, usrs);
+  /* Snakey Rain (OM, 2026-10-14): the Rain key opens the app's Rain panel. */
+  if (mobile_hotkeys_pressed(env, MOBILE_HOTKEY_RAIN)) wyrm_rain_key_press();
+#ifdef WYRM_DESKTOP
+  /* WYRM_DESKTOP: no on-screen keys on a desktop, so Eyes Back and Auto
+     restart answer their bound keys (default E and V; Settings › Controls). */
+  if (tkeyboard_key_pressed(
+          env->kb, mobile_hotkey_get_key(usrs, MOBILE_HOTKEY_EYES_BACK)))
+    eyes_back_toggle(gdata, usrs);
+  if (!WYRM_EXPERIMENTAL_ROPE_MODE &&
+      tkeyboard_key_pressed(
+          env->kb, mobile_hotkey_get_key(usrs, MOBILE_HOTKEY_ROPE_MODE))) {
+    usrs->auto_respawn = usrs->auto_respawn ? 0 : 1;
+    save_user_settings(usrs);
+  }
+#endif
+
+  /* A restart used to be thrown away once the snake was worth more than a
+     thousand — a guard against losing a good run to a stray key. On a phone
+     that reads as a broken button: the one time you most want out is when the
+     snake is big, and the tap simply did nothing. The button is a tap now, and
+     a tap does what it says. (It also indexed the last snake without checking
+     there was one, which is the same crash that was fixed in got_packet.) */
+#ifdef WYRM_DESKTOP
+  mobile_hotkeys_desktop_trace(env, gdata->data.wmd);
+#endif
+}
+
+void input(tenv* env) { input_with_policy(env, false, false); }
+
+void input_team_protected(tenv* env) { input_with_policy(env, true, false); }
+
+void input_join_alive(tenv* env) { input_with_policy(env, true, true); }

@@ -1,0 +1,29 @@
+name: macOS engine
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ['*.md']
+permissions:
+  contents: read
+jobs:
+  universal:
+    runs-on: macos-15-intel
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apple dependencies
+        run: bash Scripts/fetch-dependencies.sh
+      - name: Verify and prepare engine
+        run: python3 Scripts/prepare-engine.py
+      - name: Configure universal app
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release '-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64'
+      - name: Compile
+        run: cmake --build build --parallel 3
+      - name: Verify and package
+        run: bash Scripts/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wyrm-macOS-universal
+          path: dist/
+          retention-days: 30

@@ -1,0 +1,2725 @@
+#include "redraw.h"
+#include "../platform/android_team.h"
+#include "ui_overlay.h"
+
+#include "../user.h"
+#include "backgrounds.h"
+#include "tags.h"
+#include "studio.h"
+#include "wyrm_skins.h"
+#include "../mobile/mobile_controls.h"
+#if defined(WYRM_SDL_JNI)
+#include "../platform/android_look.h"
+#endif
+
+void lerp_minimap_float(float* dst, const uint8_t* src, int mmsz, float alpha) {
+  int stride = MAX_MINIMAP_SIZE;
+
+  for (int y = 0; y < mmsz; y++) {
+    for (int x = 0; x < mmsz; x++) {
+      int i = y * stride + x;
+      float target = (float)src[i];
+      dst[i] += alpha * (target - dst[i]);
+    }
+  }
+}
+
+void minimap_float_to_u8(const float* src, uint8_t* dst, int mmsz) {
+  int stride = MAX_MINIMAP_SIZE;
+
+  for (int y = 0; y < mmsz; y++) {
+    for (int x = 0; x < mmsz; x++) {
+      int i = y * stride + x;
+      float v = src[i];
+      dst[i] = (uint8_t)(v + 0.5f);
+    }
+  }
+}
+
+/**
+ * Wyrm's own colour for one point of a built skin, or 0 to render from the
+ * arena's palette exactly as before.
+ *
+ * A built skin carries an exact colour and an alpha the wire has no field for.
+ * Those live in this device's settings, not in anything the arena sent, so they
+ * are applied to the local snake only — another player's body is drawn from
+ * what the arena actually said about it and nothing else.
+ */
+/* Colour wheel and Wyrm beads on our own snake (OM, 2026-10-04; 0 for one
+ * drop-test build): 1 draws the exact colours we built, on this device only.
+ * Everyone else, and the arena, get the slither colours the join carried.
+ * 0 draws our snake from those slither colours too. */
+#define WYRM_BUILT_BEADS_IN_ARENA 1
+
+/* Boost glow (OM, 2026-10-18): light and fixed. The glow used to be a sprite
+   2-3x a bead (Simple) plus one 6x a bead (Normal) on every body point, which
+   alone could drop the frame rate while a long snake boosted. Now about half
+   the size, a softer alpha and every third point; no strength slider. */
+#define WYRM_BOOST_ALPHA 0.6f
+#define WYRM_BOOST_SIMPLE 0.45f
+#define WYRM_BOOST_WIDE 1.7f
+#define WYRM_BOOST_STRIDE 3
+
+static uint32_t built_skin_rgba(tenv* env, snake* o, int index) {
+  tuser_data* usr = env->usr;
+  if (!o->cusk || index < 0 || index >= MAX_SKIN_CODE_LEN) return 0;
+  /* Skin Studio (OM, 2026-10-12): the bead's own colour, opaque. */
+  if (o->id == usr->gdata.data.snake_id && studio_on())
+    return 0xFF000000u | studio_rgb_at(index);
+  if (o->id == usr->gdata.data.snake_id)
+    return WYRM_BUILT_BEADS_IN_ARENA ? usr->usrs.skin_rgba[index] : 0;
+
+  /* Someone else's, if Wyrm's own backend has told us about them. Snake ids are
+   * recycled between lives, so the name has to still match: otherwise whoever
+   * inherits an id would inherit a stranger's colours with it. */
+  game_data* gdata = &usr->gdata;
+  int remote_count = gdata->remote_skins ? (int)tdarray_length(gdata->remote_skins) : 0;
+  for (int i = 0; i < remote_count; ++i) {
+    remote_skin* skin = gdata->remote_skins + i;
+    if (skin->snake_id != o->id) continue;
+    if (strncmp(skin->nickname, o->nk, sizeof(skin->nickname) - 1) != 0) return 0;
+    if (index >= skin->length) return 0;
+    skin->last_used_ms = SDL_GetTicks();
+    return skin->rgba[index];
+  }
+  return 0;
+}
+
+/* Wyrm's own beads (OM, 2026-09-28). A built segment whose alpha byte is
+ * 0xE0 + k (beads 0-23) or 0xC0 + k - 24 (beads 24-53) wears Wyrm bead k,
+ * painted by Wyrm iOS Scripts/generate-wyrm-beads.py into six atlas cells
+ * nothing else samples (row 7 cols 3 and 6, row 8 cols 0-3), nine to a cell
+ * in a 3 x 3 grid. Every bead is drawn in its own painted colours; the RGB
+ * only picks the arena's nearest colour group. Like every slither bead, the
+ * motif sits on the +x side, the side a body drawn tail first leaves showing. */
+#define WYRM_BEAD_TAG 0xE0u
+#define WYRM_BEAD_TAG2 0xC0u
+#define WYRM_BEAD_FIRST_COUNT 24
+#define WYRM_BEAD_COUNT 54
+
+static const unsigned char wyrm_bead_cells[WYRM_BEAD_COUNT / 9][2] = {
+    {7, 3}, {7, 6}, {8, 0}, {8, 1}, {8, 2}, {8, 3}};
+
+static int wyrm_bead_kind(uint32_t rgba) {
+  uint32_t tag = rgba >> 24;
+  if (tag >= WYRM_BEAD_TAG && tag < WYRM_BEAD_TAG + WYRM_BEAD_FIRST_COUNT)
+    return (int)(tag - WYRM_BEAD_TAG);
+  if (tag >= WYRM_BEAD_TAG2 &&
+      tag < WYRM_BEAD_TAG2 + (WYRM_BEAD_COUNT - WYRM_BEAD_FIRST_COUNT))
+    return (int)(tag - WYRM_BEAD_TAG2) + WYRM_BEAD_FIRST_COUNT;
+  return -1;
+}
+
+static vec4s wyrm_bead_uv(int kind) {
+  const unsigned char* cell = wyrm_bead_cells[kind / 9];
+  float qx = (float)(kind % 3) / 3.0f, qy = (float)((kind % 9) / 3) / 3.0f;
+  return (vec4s){{(cell[1] + qx) / 7.0f, (cell[0] + qy) / 9.0f,
+                  (1.0f / 3.0f) / 7.0f, (1.0f / 3.0f) / 9.0f}};
+}
+
+static vec4s wyrm_bead_color(uint32_t rgba, int kind, float alpha) {
+  (void)rgba;
+  (void)kind;
+  return (vec4s){{1, 1, 1, alpha}};
+}
+
+/** The packed colour above, as the renderer's own RGBA. A Wyrm bead's alpha
+ * byte names its texture, so where it is drawn as a plain colour (the flat
+ * render mode) it is opaque. */
+static vec4s built_skin_color(uint32_t rgba, float alpha_scale) {
+  float alpha = wyrm_bead_kind(rgba) >= 0 ? 1.0f : ((rgba >> 24) & 0xFF) / 255.0f;
+  return (vec4s){{((rgba >> 16) & 0xFF) / 255.0f, ((rgba >> 8) & 0xFF) / 255.0f,
+                  (rgba & 0xFF) / 255.0f, alpha * alpha_scale}};
+}
+
+/* Wyrm (ported from Wyrm iOS) — the slither.io Android client's Build-a-Slither beads.
+ *
+ * A bead built with the colour wheel keeps its exact picked RGB in the low
+ * 24 bits and names its Android texture in the alpha byte, so it travels
+ * unchanged through settings and Wyrm's arena skin sync:
+ *   0xFE  nsk 0, AIR `kmc_ts[9][0]`  (plain bead)
+ *   0xFD  nsk 1, AIR `kmc_ts[29][0]` (dark core, light rim)
+ * Their atlas cells hold exact ports of those AIR bitmaps and of `ksmc_t`,
+ * the outline and drop shadow AIR draws beneath each such bead. */
+#define APPLE_AIR_SHADOW_SCALE (102.0f / 64.0f)
+/* Off (OM, 2026-09-28): the `ksmc_t` stamps read as a black shadow wrapped
+ * round the whole snake, which beads picked from the grid never had. With it
+ * off, wheel beads get the same shadows as every other bead. 1 restores AIR. */
+#define WYRM_AIR_BEAD_SHADOW 0
+
+static int apple_air_kind(uint32_t rgba) {
+  uint32_t tag = rgba >> 24;
+  return tag == 0xFEu ? 0 : tag == 0xFDu ? 1 : -1;
+}
+
+static vec4s apple_air_bead_uv(int kind) {
+  return (vec4s){{(2 + kind) / 7.0f, 6 / 9.0f, 1 / 7.0f, 1 / 9.0f}};
+}
+
+static vec4s apple_air_shadow_uv(void) {
+  return (vec4s){{4 / 7.0f, 6 / 9.0f, APPLE_AIR_SHADOW_SCALE / 7.0f,
+                  APPLE_AIR_SHADOW_SCALE / 9.0f}};
+}
+
+/* AIR setSkin: when mid + max channel is below nsk_min2c (255 for nsk 0 and
+ * 1) every channel is lifted by 1 + (255 - (mid + max)) / 2, capped at 255,
+ * then truncated by the `<< 16 | << 8 |` pack. */
+static vec4s apple_air_tint(uint32_t rgba, float alpha) {
+  float c[3] = {(float)((rgba >> 16) & 0xFF), (float)((rgba >> 8) & 0xFF),
+                (float)(rgba & 0xFF)};
+  float lo = fminf(c[0], fminf(c[1], c[2]));
+  float hi = fmaxf(c[0], fmaxf(c[1], c[2]));
+  float mid = c[0] + c[1] + c[2] - lo - hi;
+  if (mid + hi < 255) {
+    float lift = 1 + (255 - (mid + hi)) / 2;
+    for (int i = 0; i < 3; ++i) c[i] = fminf(255, c[i] + lift);
+  }
+  for (int i = 0; i < 3; ++i) c[i] = floorf(c[i]);
+  return (vec4s){{c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f, alpha}};
+}
+
+static int apple_air_kind_at(tenv* env, snake* o, int point) {
+  if (!o->cusk || o->cusk_len <= 0 || point < 0) return -1;
+  uint32_t built = built_skin_rgba(env, o, point % o->cusk_len);
+  return built ? apple_air_kind(built) : -1;
+}
+
+/* One `ksmc_t` stamp: unrotated, centred on the point, AIR's size. */
+static void apple_air_shadow(tenv* env, int point, float half, float alpha,
+                             float mww2, float mhh2) {
+  game_data* gdata = &env->usr->gdata;
+  float fix = (gdata->data.pbx[point] - gdata->data.view_xx) * gdata->data.gsc + mww2;
+  float fiy = (gdata->data.pby[point] - gdata->data.view_yy) * gdata->data.gsc + mhh2;
+  /* Only a stamp that shows (OM, 2026-10-12): on screen, and not faded to
+     nothing where the points bunch up. */
+  if (alpha < 1.0f / 255.0f) return;
+  if (fix + half < 0 || fiy + half < 0 || fix - half > 2 * mww2 ||
+      fiy - half > 2 * mhh2)
+    return;
+  bp_renderer_push(env->usr->r->bpr,
+                   &(bp_instance){{fix - half, fiy - half, 2 * half, 0},
+                                  apple_air_shadow_uv(),
+                                  {0, 0, 0, alpha}});
+}
+
+/* AIR's `_loc18_`: a shadow fades where consecutive stamps bunch up. */
+static float apple_air_spacing(tenv* env, int point, float* sx, float* sy) {
+  game_data* gdata = &env->usr->gdata;
+  float ox = *sx, oy = *sy;
+  *sx = gdata->data.pbx[point];
+  *sy = gdata->data.pby[point];
+  float d = fabsf(*sx - ox) + fabsf(*sy - oy);
+  return fminf(1, d / 6);
+}
+
+/* Modes › Snake shadow (OM, 2026-10-09). The AIR client gives every snake
+ * `has_shadow` (setSkin) and draws `ksmc_t` beneath it (Main.as redraw): the
+ * head's first nine points fading out, then the tail's last four, then, as
+ * the body is drawn from the tail, one four points behind each body point,
+ * faded where the points bunch up. Same stamp, size and order as the wheel
+ * beads' shadow above, for every point of every snake. */
+static void air_snake_shadow_ends(tenv* env, int bp, float half, float a,
+                                  float mww2, float mhh2, float* sx,
+                                  float* sy) {
+  game_data* gdata = &env->usr->gdata;
+  for (int p = bp - 1 < 8 ? bp - 1 : 8; p >= 0; p--)
+    if (gdata->data.pbu[p] == 2)
+      apple_air_shadow(env, p, half, a * (1 - p / 9.0f), mww2, mhh2);
+  for (int n = 1; n <= 4; ++n) {
+    int p = bp - n;
+    if (p < 0 || gdata->data.pbu[p] != 2) continue;
+    float spacing = apple_air_spacing(env, p, sx, sy);
+    if (n == 1) spacing = 1;
+    apple_air_shadow(env, p, half, spacing * a * (p < 9 ? p / 9.0f : 1), mww2,
+                     mhh2);
+  }
+}
+
+static void air_snake_shadow_behind(tenv* env, int j, float half, float a,
+                                    float mww2, float mhh2, float* sx,
+                                    float* sy) {
+  game_data* gdata = &env->usr->gdata;
+  int p = j - 4;
+  if (p < 0 || gdata->data.pbu[p] != 2) return;
+  float spacing = apple_air_spacing(env, p, sx, sy);
+  apple_air_shadow(env, p, half, spacing * a * (p < 9 ? p / 9.0f : 1), mww2,
+                   mhh2);
+}
+
+/* Food style is presentation only. Mixed hashes the arena's existing id so a
+ * morsel keeps its shape for its whole life without adding state or wire data. */
+static float food_shape(const food* fo, int style) {
+  if (style == 0) return 0.0f;
+  if (style == 1) return 1.0f;
+  if (style >= 3) return (float)(style - 1);
+
+  uint64_t hash = (uint64_t)fo->id;
+  hash ^= hash >> 33;
+  hash *= UINT64_C(0xff51afd7ed558ccd);
+  hash ^= hash >> 33;
+  return (float)(hash % UINT64_C(8));
+}
+
+/* Skin Studio (OM, 2026-10-12): the player's own snake, on this phone. */
+static bool studio_own(tenv* env, snake* o) {
+  return studio_on() && o->id == env->usr->gdata.data.snake_id;
+}
+
+/* Which bead a body point wears: the Studio's pattern for the player's own
+   snake, else the arena's skin. */
+static int studio_slot(tenv* env, snake* o, int point, int cusk_len) {
+  if (studio_own(env, o)) {
+    int len = studio_current()->pattern_len;
+    return len > 0 ? point % len : 0;
+  }
+  return cusk_len > 0 ? point % cusk_len : 0;
+}
+
+/* A Studio cell as a sprite uv: shifted right, so bp.slang samples the
+   Studio atlas. */
+static vec4s studio_cell_uv(int cell) {
+  float g = 1.0f / STUDIO_GRID;
+  return (vec4s){{STUDIO_UV_SHIFT + (cell % STUDIO_GRID) * g,
+                  (cell / STUDIO_GRID) * g, g, g}};
+}
+
+/* The boost glow of a Studio bead: its own colour. */
+static vec3s* studio_glow_for(tenv* env, snake* o, int point, vec3s* scratch,
+                              vec3s* fallback) {
+  if (!studio_own(env, o)) return fallback;
+  uint32_t rgb = studio_rgb_at(studio_slot(env, o, point, 1));
+  scratch->r = ((rgb >> 16) & 0xFF) / 255.0f;
+  scratch->g = ((rgb >> 8) & 0xFF) / 255.0f;
+  scratch->b = (rgb & 0xFF) / 255.0f;
+  return scratch;
+}
+
+/* The Studio's eyes: any number, anywhere on the head, each a white and a
+   pupil from the atlas, turned with the head. The pupil sits half a unit
+   forward and follows where the snake looks (rex/rey) as slither's does. */
+static void studio_draw_eyes(tenv* env, snake* o, float fang, float hx,
+                             float hy, float ssc, float ea, float mww2,
+                             float mhh2) {
+  game_data* gdata = &env->usr->gdata;
+  const studio_skin* s = studio_current();
+  float c = cosf(fang), sn = sinf(fang);
+  for (int i = 0; i < s->eye_count; ++i) {
+    const studio_eye* e = s->eyes + i;
+    float ex = (c * e->fwd - sn * e->side) * ssc;
+    float ey = (sn * e->fwd + c * e->side) * ssc;
+    float wr = e->white_r * ssc * gdata->data.gsc;
+    if (wr > 0.0f) {
+      float cx = mww2 + (ex + hx - gdata->data.view_xx) * gdata->data.gsc;
+      float cy = mhh2 + (ey + hy - gdata->data.view_yy) * gdata->data.gsc;
+      bp_renderer_push(env->usr->r->bpr,
+                       &(bp_instance){{cx - wr, cy - wr, wr * 2, fang},
+                                      studio_cell_uv(e->white_cell),
+                                      {1, 1, 1, ea}});
+    }
+    float pr = e->pupil_r * ssc * gdata->data.gsc;
+    if (pr > 0.0f) {
+      float px = ex + c * 0.5f + o->rex * ssc * e->look;
+      float py = ey + sn * 0.5f + o->rey * ssc * e->look;
+      float cx = mww2 + (px + hx - gdata->data.view_xx) * gdata->data.gsc;
+      float cy = mhh2 + (py + hy - gdata->data.view_yy) * gdata->data.gsc;
+      bp_renderer_push(env->usr->r->bpr,
+                       &(bp_instance){{cx - pr, cy - pr, pr * 2, fang},
+                                      studio_cell_uv(e->pupil_cell),
+                                      {1, 1, 1, ea}});
+    }
+  }
+}
+
+int arp(snake* o, int q, float xx, float yy) {
+  if (q < tdarray_length(o->gptz)) {
+    int gpo_i = q;
+    o->gptz[gpo_i].xx = xx;
+    o->gptz[gpo_i].yy = yy;
+    return gpo_i;
+  } else {
+    gpt gpo = {.xx = xx, .yy = yy};
+    tdarray_push(&o->gptz, &gpo);
+    int gptz_len = tdarray_length(o->gptz);
+    return gptz_len - 1;
+  }
+}
+
+static inline bool point_in_snake_view(const game_data* gdata, float x,
+                                       float y) {
+  return x >= gdata->data.bpx1 && y >= gdata->data.bpy1 &&
+         x <= gdata->data.bpx2 && y <= gdata->data.bpy2;
+}
+
+static void draw_rope_backbone(tenv* env, snake* o, int point_count,
+                               float center_x, float center_y, float alpha) {
+  game_data* gdata = &env->usr->gdata;
+  int color_id = o->cusk && o->cusk_len > 0 ? o->cusk_data[0]
+                                            : gdata->default_skins[o->cv][1];
+  vec3s* rope_color = gdata->cg_colors + color_id;
+  ImDrawList* draw = igGetWindowDrawList();
+  const ImU32 outline =
+      igColorConvertFloat4ToU32((ImVec4){0.01f, 0.012f, 0.012f, alpha * 0.78f});
+  const ImU32 core = igColorConvertFloat4ToU32(
+      (ImVec4){rope_color->r, rope_color->g, rope_color->b, alpha});
+
+  /* The sampled points are the same centreline used by the normal body. Two
+
+   * passes keep that line readable over food without making its visual width
+
+   * resemble a collision-safe snake. */
+  for (int pass = 0; pass < 2; ++pass) {
+    bool have_previous = false;
+    ImVec2 previous = {0};
+    for (int point = 0; point < point_count; ++point) {
+      if (gdata->data.pbu[point] < 1) {
+        have_previous = false;
+        continue;
+      }
+      ImVec2 current = {
+          center_x +
+              (gdata->data.pbx[point] - gdata->data.view_xx) * gdata->data.gsc,
+          center_y +
+              (gdata->data.pby[point] - gdata->data.view_yy) * gdata->data.gsc};
+      if (have_previous)
+        ImDrawList_AddLine(draw, previous, current, pass == 0 ? outline : core,
+                           pass == 0 ? 4.2f : 2.0f);
+      previous = current;
+      have_previous = true;
+    }
+  }
+
+  if (point_count > 0 && gdata->data.pbu[0] >= 1) {
+    ImVec2 head = {
+        center_x + (gdata->data.pbx[0] - gdata->data.view_xx) * gdata->data.gsc,
+        center_y +
+            (gdata->data.pby[0] - gdata->data.view_yy) * gdata->data.gsc};
+    ImDrawList_AddCircleFilled(draw, head, 2.1f, outline, 12);
+    ImDrawList_AddCircleFilled(draw, head, 1.0f, core, 12);
+  }
+}
+
+/* mobile/mobile_controls.c: the arrow upright, the chosen steering sideways. */
+int mobile_controls_steering_mode(tenv* env);
+
+
+/* Skinless strip and the spine (OM, 2026-10-05). ImGui is drawn after the
+   sprite batches, so a line here covers the body. Eyes for these modes are
+   circles on the same list and therefore sit on top. */
+static void snake_screen_point(const game_data* gdata, int point, float cx,
+                               float cy, ImVec2* out) {
+  out->x = cx + (gdata->data.pbx[point] - gdata->data.view_xx) * gdata->data.gsc;
+  out->y = cy + (gdata->data.pby[point] - gdata->data.view_yy) * gdata->data.gsc;
+}
+
+static void stroke_smooth(ImDrawList* draw, ImVec2* pts, int count, ImU32 col,
+                          float width) {
+  int i;
+  if (count < 2 || width <= 0.0f) return;
+  ImDrawList_PathClear(draw);
+  ImDrawList_PathLineTo(draw, pts[0]);
+  for (i = 1; i < count - 1; ++i) {
+    ImVec2 mid;
+    mid.x = (pts[i].x + pts[i + 1].x) * 0.5f;
+    mid.y = (pts[i].y + pts[i + 1].y) * 0.5f;
+    ImDrawList_PathBezierQuadraticCurveTo(draw, pts[i], mid, 0);
+  }
+  ImDrawList_PathLineTo(draw, pts[count - 1]);
+  ImDrawList_PathStroke(draw, col, 0, width);
+}
+
+/* On-screen runs only. A full buffer is stroked and continued from its last
+   point so a long snake does not need a 32k stack. */
+static void draw_body_line(tenv* env, int bp, int start, float cx, float cy,
+                           ImU32 under, float under_w, ImU32 over, float over_w) {
+  game_data* gdata = &env->usr->gdata;
+  ImDrawList* draw = igGetWindowDrawList();
+  ImVec2 buf[160];
+  int n = 0;
+  int i;
+  for (i = start; i <= bp; ++i) {
+    int live = i < bp && gdata->data.pbu[i] >= 1;
+    if (live && n < 160) {
+      snake_screen_point(gdata, i, cx, cy, &buf[n]);
+      n += 1;
+      if (n < 160) continue;
+    }
+    if (n >= 2) {
+      if (under_w > 0.0f) stroke_smooth(draw, buf, n, under, under_w);
+      stroke_smooth(draw, buf, n, over, over_w);
+    }
+    if (live) {
+      buf[0] = buf[n > 0 ? n - 1 : 0];
+      n = 1;
+    } else {
+      n = 0;
+    }
+  }
+}
+
+static void snake_strip_colour(tenv* env, snake* o, float* red, float* green,
+                               float* blue) {
+  game_data* gdata = &env->usr->gdata;
+  uint32_t built = built_skin_rgba(env, o, 0);
+  int cg_id;
+  vec3s* col;
+  if (built) {
+    *red = (float)((built >> 16) & 255) / 255.0f;
+    *green = (float)((built >> 8) & 255) / 255.0f;
+    *blue = (float)(built & 255) / 255.0f;
+    return;
+  }
+  cg_id = o->cusk && o->cusk_len > 0 ? o->cusk_data[0]
+                                    : gdata->default_skins[o->cv][1];
+  col = gdata->cg_colors + cg_id;
+  *red = col->r;
+  *green = col->g;
+  *blue = col->b;
+}
+
+static float snake_line_dpi(tenv* env) {
+  float dpi = 1.0f;
+  int w;
+  int h;
+  float short_side;
+  if (!env->wnd) return dpi;
+  w = env->wnd->size[0];
+  h = env->wnd->size[1];
+  short_side = (float)(w < h ? w : h);
+  dpi = short_side / 480.0f;
+  if (dpi < 1.0f) dpi = 1.0f;
+  return dpi;
+}
+
+/*
+ * Skinless is drawn as its own mesh (OM, 2026-10-05: the strip broke up and
+ * squished as a loop tightened). ImGui's thick stroke joins every bend with a
+ * mitre; once a bend is tighter than the strip is wide, the mitre flips and
+ * the strip folds over itself. Here the centre line is the same midpoint curve
+ * (NTL's quadraticCurveTo path), sampled densely; each sample gets a plain
+ * perpendicular (no mitre); the inside of a bend never reaches past that
+ * bend's own centre, so nothing folds; the ends are round (NTL's lineCap);
+ * and a 1 px fade on the outside edge stands in for ImGui's anti-aliasing.
+ */
+#define SKINLESS_RUN 1024
+#define SKINLESS_DENSE 8192
+#define SKINLESS_CAP_SEGMENTS 12
+static ImVec2 skinless_pts[SKINLESS_DENSE];
+
+static void skinless_push(ImVec2 p, int* m) {
+  if (*m > 0) {
+    float dx = p.x - skinless_pts[*m - 1].x;
+    float dy = p.y - skinless_pts[*m - 1].y;
+    if (dx * dx + dy * dy < 0.0001f) return;
+  }
+  if (*m < SKINLESS_DENSE) skinless_pts[(*m)++] = p;
+}
+
+static int skinless_pieces(float len, float step) {
+  int k = (int)ceilf(len / step);
+  if (k < 1) k = 1;
+  if (k > 24) k = 24;
+  return k;
+}
+
+/* The same curve stroke_smooth lays: start, quadratics through the midpoints,
+   straight to the end. */
+static int skinless_sample(const ImVec2* pts, int n, float step) {
+  int m = 0;
+  int i;
+  int s;
+  int k;
+  ImVec2 from = pts[0];
+  skinless_push(from, &m);
+  for (i = 1; i < n - 1; ++i) {
+    ImVec2 c = pts[i];
+    ImVec2 to = {(pts[i].x + pts[i + 1].x) * 0.5f,
+                 (pts[i].y + pts[i + 1].y) * 0.5f};
+    k = skinless_pieces(hypotf(c.x - from.x, c.y - from.y) +
+                            hypotf(to.x - c.x, to.y - c.y),
+                        step);
+    for (s = 1; s <= k; ++s) {
+      float t = (float)s / (float)k;
+      float u = 1.0f - t;
+      ImVec2 q = {u * u * from.x + 2.0f * u * t * c.x + t * t * to.x,
+                  u * u * from.y + 2.0f * u * t * c.y + t * t * to.y};
+      skinless_push(q, &m);
+    }
+    from = to;
+  }
+  if (n >= 2) {
+    ImVec2 to = pts[n - 1];
+    k = skinless_pieces(hypotf(to.x - from.x, to.y - from.y), step);
+    for (s = 1; s <= k; ++s) {
+      float t = (float)s / (float)k;
+      ImVec2 q = {from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t};
+      skinless_push(q, &m);
+    }
+  }
+  return m;
+}
+
+static ImVec2 skinless_unit(float x, float y) {
+  float len = sqrtf(x * x + y * y);
+  ImVec2 out = {0.0f, 0.0f};
+  if (len > 0.000001f) {
+    out.x = x / len;
+    out.y = y / len;
+  }
+  return out;
+}
+
+/* A round end: a half disc out of `end`, from the +normal rail round to the
+   -normal rail through `out`, with the same 1 px fade. */
+static void skinless_cap(ImDrawList* draw, ImVec2 uv, ImVec2 end, ImVec2 nrm,
+                         ImVec2 out, float r, ImU32 col, ImU32 clear) {
+  const int k = SKINLESS_CAP_SEGMENTS;
+  int i;
+  ImDrawIdx base;
+  ImDrawList_PrimReserve(draw, 9 * k, 1 + 2 * (k + 1));
+  base = (ImDrawIdx)draw->_VtxCurrentIdx;
+  ImDrawList_PrimWriteVtx(draw, end, uv, col);
+  for (i = 0; i <= k; ++i) {
+    float a = (float)PI * (float)i / (float)k;
+    float dx = nrm.x * cosf(a) + out.x * sinf(a);
+    float dy = nrm.y * cosf(a) + out.y * sinf(a);
+    ImDrawList_PrimWriteVtx(draw, (ImVec2){end.x + dx * r, end.y + dy * r}, uv,
+                            col);
+    ImDrawList_PrimWriteVtx(
+        draw, (ImVec2){end.x + dx * (r + 1.0f), end.y + dy * (r + 1.0f)}, uv,
+        clear);
+  }
+  for (i = 0; i < k; ++i) {
+    ImDrawIdx rim = (ImDrawIdx)(base + 1 + 2 * i);
+    ImDrawIdx next = (ImDrawIdx)(rim + 2);
+    ImDrawList_PrimWriteIdx(draw, base);
+    ImDrawList_PrimWriteIdx(draw, rim);
+    ImDrawList_PrimWriteIdx(draw, next);
+    ImDrawList_PrimWriteIdx(draw, rim);
+    ImDrawList_PrimWriteIdx(draw, (ImDrawIdx)(rim + 1));
+    ImDrawList_PrimWriteIdx(draw, (ImDrawIdx)(next + 1));
+    ImDrawList_PrimWriteIdx(draw, rim);
+    ImDrawList_PrimWriteIdx(draw, (ImDrawIdx)(next + 1));
+    ImDrawList_PrimWriteIdx(draw, next);
+  }
+}
+
+/* One run of the strip: `buf` is the on-screen body points, head first. */
+static void draw_skinless_run(ImDrawList* draw, ImVec2* buf, int n, ImU32 col,
+                              float width, int cap_start, int cap_end) {
+  float r = width * 0.5f;
+  ImU32 clear = col & 0x00FFFFFFu; /* same colour, alpha 0 (alpha is the top byte) */
+  ImVec2 uv;
+  ImVec2 first_n = {0.0f, 0.0f};
+  ImVec2 first_t = {0.0f, 0.0f};
+  ImVec2 last_n = {0.0f, 0.0f};
+  ImVec2 last_t = {0.0f, 0.0f};
+  int m;
+  int j;
+  ImDrawIdx base;
+  if (n < 1 || width <= 0.0f) return;
+  if (n == 1) {
+    if (cap_start || cap_end) ImDrawList_AddCircleFilled(draw, buf[0], r, col, 24);
+    return;
+  }
+  {
+    /* Samples about a third of the strip's half-width apart, spread wider on
+       a very long run so the whole run always fits the buffer. */
+    float length = 0.0f;
+    float step;
+    for (j = 1; j < n; ++j)
+      length += hypotf(buf[j].x - buf[j - 1].x, buf[j].y - buf[j - 1].y);
+    step = fmaxf(3.0f, r * 0.35f); /* 3 px (was 1.5): lighter (2026-10-12) */
+    step = fmaxf(step, length / (float)(SKINLESS_DENSE - 2 * n - 64));
+    m = skinless_sample(buf, n, step);
+  }
+  if (m < 2) {
+    if (cap_start || cap_end) ImDrawList_AddCircleFilled(draw, buf[0], r, col, 24);
+    return;
+  }
+  igGetFontTexUvWhitePixel(&uv);
+
+  ImDrawList_PrimReserve(draw, 18 * (m - 1), 4 * m);
+  base = (ImDrawIdx)draw->_VtxCurrentIdx;
+  for (j = 0; j < m; ++j) {
+    ImVec2 p = skinless_pts[j];
+    ImVec2 a = j > 0 ? skinless_unit(p.x - skinless_pts[j - 1].x,
+                                     p.y - skinless_pts[j - 1].y)
+                     : skinless_unit(skinless_pts[1].x - p.x,
+                                     skinless_pts[1].y - p.y);
+    ImVec2 b = j < m - 1 ? skinless_unit(skinless_pts[j + 1].x - p.x,
+                                         skinless_pts[j + 1].y - p.y)
+                         : a;
+    ImVec2 t = skinless_unit(a.x + b.x, a.y + b.y);
+    ImVec2 nrm;
+    float off_l = r;
+    float off_r = r;
+    float fade_l = 1.0f;
+    float fade_r = 1.0f;
+    if (t.x == 0.0f && t.y == 0.0f) t = b;
+    nrm = (ImVec2){-t.y, t.x};
+    if (j > 0 && j < m - 1) {
+      float cross = a.x * b.y - a.y * b.x;
+      float dot = a.x * b.x + a.y * b.y;
+      float turn = fabsf(atan2f(cross, dot));
+      if (turn > 0.0001f) {
+        float la = hypotf(p.x - skinless_pts[j - 1].x, p.y - skinless_pts[j - 1].y);
+        float lb = hypotf(skinless_pts[j + 1].x - p.x, skinless_pts[j + 1].y - p.y);
+        float bend = 0.5f * (la + lb) / turn; /* this bend's radius */
+        /* The inside of the bend is the side the path turns to. */
+        if (bend < r) {
+          if (cross > 0.0f) {
+            off_l = bend;
+            fade_l = 0.0f;
+          } else {
+            off_r = bend;
+            fade_r = 0.0f;
+          }
+        }
+      }
+    }
+    if (j == 0) {
+      first_n = nrm;
+      first_t = t;
+    }
+    if (j == m - 1) {
+      last_n = nrm;
+      last_t = t;
+    }
+    ImDrawList_PrimWriteVtx(draw, (ImVec2){p.x + nrm.x * (off_l + fade_l),
+                                           p.y + nrm.y * (off_l + fade_l)},
+                            uv, clear);
+    ImDrawList_PrimWriteVtx(draw, (ImVec2){p.x + nrm.x * off_l, p.y + nrm.y * off_l},
+                            uv, col);
+    ImDrawList_PrimWriteVtx(draw, (ImVec2){p.x - nrm.x * off_r, p.y - nrm.y * off_r},
+                            uv, col);
+    ImDrawList_PrimWriteVtx(draw, (ImVec2){p.x - nrm.x * (off_r + fade_r),
+                                           p.y - nrm.y * (off_r + fade_r)},
+                            uv, clear);
+  }
+  for (j = 0; j < m - 1; ++j) {
+    ImDrawIdx s = (ImDrawIdx)(base + 4 * j);
+    ImDrawIdx e = (ImDrawIdx)(s + 4);
+    int q;
+    for (q = 0; q < 3; ++q) {
+      ImDrawList_PrimWriteIdx(draw, (ImDrawIdx)(s + q));
+      ImDrawList_PrimWriteIdx(draw, (ImDrawIdx)(s + q + 1));
+      ImDrawList_PrimWriteIdx(draw, (ImDrawIdx)(e + q + 1));
+      ImDrawList_PrimWriteIdx(draw, (ImDrawIdx)(s + q));
+      ImDrawList_PrimWriteIdx(draw, (ImDrawIdx)(e + q + 1));
+      ImDrawList_PrimWriteIdx(draw, (ImDrawIdx)(e + q));
+    }
+  }
+  if (cap_start)
+    skinless_cap(draw, uv, skinless_pts[0], first_n,
+                 (ImVec2){-first_t.x, -first_t.y}, r, col, clear);
+  if (cap_end)
+    skinless_cap(draw, uv, skinless_pts[m - 1], last_n, last_t, r, col, clear);
+}
+
+/* Skinless, like NTL's of() (OM, 2026-10-05). lsz is already half of 29*sc,
+   so a plain disc is 2 * lsz * gsc across and this stroke is that wide.
+   Round caps add that radius at each real end, which is the disc. Alpha is
+   NTL's skinless transparency: .8 times the snake's own fade. Runs continue
+   past SKINLESS_RUN points so a long snake is not cut short. */
+static void draw_skinless_strip(tenv* env, snake* o, int bp, float cx, float cy,
+                                float lsz, float alpha) {
+  game_data* gdata = &env->usr->gdata;
+  ImDrawList* draw = igGetWindowDrawList();
+  ImVec2 buf[SKINLESS_RUN];
+  int n = 0;
+  int i;
+  int continued = 0;
+  float red, green, blue;
+  float width = 2.0f * lsz * gdata->data.gsc;
+  ImU32 main_col;
+  ImU32 glow_col;
+  int boosting = o->tsp > o->fsp;
+  snake_strip_colour(env, o, &red, &green, &blue);
+  main_col = igColorConvertFloat4ToU32((ImVec4){red, green, blue, 0.8f * alpha});
+  glow_col = igColorConvertFloat4ToU32((ImVec4){red, green, blue, 0.22f * alpha});
+  for (i = 0; i <= bp; ++i) {
+    int live = i < bp && gdata->data.pbu[i] >= 1;
+    int more;
+    int cap_start;
+    int cap_end;
+    if (live && n < SKINLESS_RUN) {
+      snake_screen_point(gdata, i, cx, cy, &buf[n]);
+      n += 1;
+      if (n < SKINLESS_RUN) continue;
+    }
+    if (n >= 1) {
+      more = live;
+      cap_start = !continued;
+      cap_end = !more;
+      if (boosting)
+        draw_skinless_run(draw, buf, n, glow_col, width * 1.08f, cap_start,
+                          cap_end);
+      draw_skinless_run(draw, buf, n, main_col, width, cap_start, cap_end);
+    }
+    if (live) {
+      buf[0] = buf[n > 0 ? n - 1 : 0];
+      n = 1;
+      continued = 1;
+    } else {
+      n = 0;
+      continued = 0;
+    }
+  }
+}
+
+/* A spine wider than the thread is drawn on the skinless mesh, so it does
+   not fold where the body coils tight (a thick ImGui polyline mitres). One
+   layer (OM, 2026-10-12). */
+static void draw_spine_mesh(tenv* env, int bp, float cx, float cy, ImU32 over,
+                            float over_w) {
+  game_data* gdata = &env->usr->gdata;
+  ImDrawList* draw = igGetWindowDrawList();
+  ImVec2 buf[SKINLESS_RUN];
+  int n = 0;
+  int i;
+  int continued = 0;
+  for (i = 1; i <= bp; ++i) {
+    int live = i < bp && gdata->data.pbu[i] >= 1;
+    if (live && n < SKINLESS_RUN) {
+      snake_screen_point(gdata, i, cx, cy, &buf[n]);
+      n += 1;
+      if (n < SKINLESS_RUN) continue;
+    }
+    if (n >= 1)
+      draw_skinless_run(draw, buf, n, over, over_w, !continued, !live);
+    if (live) {
+      buf[0] = buf[n > 0 ? n - 1 : 0];
+      n = 1;
+      continued = 1;
+    } else {
+      n = 0;
+      continued = 0;
+    }
+  }
+}
+
+/* The reference client's centre line (OM, 2026-10-12): one straight line per segment,
+   skipped when neither end is within 8 px of the screen. */
+static void draw_spine_lines(tenv* env, int bp, float cx, float cy, ImU32 col,
+                             float width) {
+  game_data* gdata = &env->usr->gdata;
+  ImDrawList* draw = igGetWindowDrawList();
+  const float margin = 8.0f;
+  const float right = 2.0f * cx + margin;
+  const float bottom = 2.0f * cy + margin;
+  ImVec2 last = {0.0f, 0.0f};
+  int have = 0;
+  int i;
+  for (i = 1; i < bp; ++i) {
+    ImVec2 at;
+    int seen;
+    if (gdata->data.pbu[i] < 1) {
+      have = 0;
+      continue;
+    }
+    snake_screen_point(gdata, i, cx, cy, &at);
+    seen = (at.x >= -margin && at.y >= -margin && at.x <= right && at.y <= bottom) ||
+           (last.x >= -margin && last.y >= -margin && last.x <= right &&
+            last.y <= bottom);
+    if (have && seen) ImDrawList_AddLine(draw, last, at, col, width);
+    last = at;
+    have = 1;
+  }
+}
+
+/* Spine width (OM, 2026-10-09): the slider is a share of the body's width
+   (`body_w`, the bead's diameter on screen): 0 draws nothing, 1 is as wide as
+   the snake, smooth in between. Light like the reference client's centre line (OM,
+   2026-10-12): one colour, white, or black on a very light snake (the reference client's
+   luminance rule); up to 2 dpi one line per segment, wider the skinless mesh
+   in one layer. Returns 1 when the mesh was drawn (it can cover the head, so
+   the eyes go on top). */
+static int draw_snake_spine(tenv* env, snake* o, int bp, float cx, float cy,
+                            float alpha, float body_w, float width) {
+  float dpi = snake_line_dpi(env);
+  float over_w;
+  float red, green, blue;
+  float ink;
+  ImU32 col;
+  if (!(width > 0.0f) || !(body_w > 0.0f)) return 0;
+  if (width > 1.0f) width = 1.0f;
+  over_w = body_w * width;
+  snake_strip_colour(env, o, &red, &green, &blue);
+  ink = red * 0.2126f + green * 0.7152f + blue * 0.0722f > 0.82f ? 0.0f : 1.0f;
+  col = igColorConvertFloat4ToU32((ImVec4){ink, ink, ink, 0.8f * alpha});
+  if (over_w <= 2.0f * dpi) {
+    draw_spine_lines(env, bp, cx, cy, col, over_w);
+    return 0;
+  }
+  draw_spine_mesh(env, bp, cx, cy, col, over_w);
+  return 1;
+}
+
+static void draw_snake_imgui_eyes(tenv* env, snake* o, float fang, float hx,
+                                  float hy, float ssc, float ea, float cx,
+                                  float cy) {
+  game_data* gdata = &env->usr->gdata;
+  default_skin_data* dfs = gdata->dfs + ((1 - o->cusk) * (1 + o->cv));
+  float ed = 6 * ssc;
+  float esp = 6 * ssc;
+  float iris_r = 6 * ssc * gdata->data.gsc;
+  float pupil_r = dfs->pr * ssc * gdata->data.gsc;
+  ImDrawList* draw = igGetWindowDrawList();
+  ImU32 iris = igColorConvertFloat4ToU32((ImVec4){dfs->ec.r, dfs->ec.g, dfs->ec.b, ea});
+  ImU32 pupil =
+      igColorConvertFloat4ToU32((ImVec4){dfs->ppc.r, dfs->ppc.g, dfs->ppc.b, ea});
+  float side;
+  float ex;
+  float ey;
+  ImVec2 at;
+  /* Only for a head on screen (OM, 2026-10-12). */
+  if (!point_in_snake_view(gdata, hx, hy)) return;
+  for (side = -1.0f; side <= 1.0f; side += 2.0f) {
+    ex = cosf(fang) * ed + cosf(fang + side * (PI / 2)) * (esp + 0.5f);
+    ey = sinf(fang) * ed + sinf(fang + side * (PI / 2)) * (esp + 0.5f);
+    at.x = cx + (ex + hx - gdata->data.view_xx) * gdata->data.gsc;
+    at.y = cy + (ey + hy - gdata->data.view_yy) * gdata->data.gsc;
+    ImDrawList_AddCircleFilled(draw, at, iris_r, iris, 0);
+    ex = cosf(fang) * (ed + 0.5f) + o->rex * ssc +
+         cosf(fang + side * (PI / 2)) * esp;
+    ey = sinf(fang) * (ed + 0.5f) + o->rey * ssc +
+         sinf(fang + side * (PI / 2)) * esp;
+    at.x = cx + (ex + hx - gdata->data.view_xx) * gdata->data.gsc;
+    at.y = cy + (ey + hy - gdata->data.view_yy) * gdata->data.gsc;
+    ImDrawList_AddCircleFilled(draw, at, pupil_r, pupil, 0);
+  }
+}
+
+void redraw(tenv* env) {
+  android_team_begin_frame();
+  tuser_data* usr = env->usr;
+  tcontext* ctx = env->ctx;
+  game_data* gdata = &usr->gdata;
+  user_settings* usrs = &usr->usrs;
+
+  /* Once a frame, so that every rope in the frame is advanced by the same
+     amount of time rather than by whatever the clock said when its snake
+     happened to be drawn. */
+  tags_tick(env);
+  /* Tags flying off dead snakes (OM, 2026-10-13). */
+  tags_draw_flying(env);
+
+  float lvx = gdata->data.view_xx;
+  float lvy = gdata->data.view_xx;
+
+  float mww2 = ctx->size[0] / 2.0f;
+  float mhh2 = ctx->size[1] / 2.0f;
+
+  float mwwp50 = ctx->size[0] + 50;
+  float mhhp50 = ctx->size[1] + 50;
+
+  gameplay_mode* mode = usrs->modes + usrs->hotkeys[HOTKEY_ASSIST].active;
+
+  if (!gdata->data.dead) {
+    if (gdata->data.fvtg > 0) {
+      gdata->data.fvtg--;
+      gdata->data.fvx = gdata->data.fvxs[gdata->data.fvpos];
+      gdata->data.fvy = gdata->data.fvys[gdata->data.fvpos];
+      gdata->data.fvxs[gdata->data.fvpos] = 0;
+      gdata->data.fvys[gdata->data.fvpos] = 0;
+      gdata->data.fvpos++;
+      if (gdata->data.fvpos >= GD_VFC) gdata->data.fvpos = 0;
+    }
+
+    int snakes_len = tdarray_length(gdata->data.snakes);
+    /* Nothing to follow means the camera stays where it was, rather than
+       following a snake that is no longer in the list. */
+    if (gdata->data.follow_view && snakes_len > 0) {
+      snake* me = gdata->data.snakes + (snakes_len - 1);
+      gdata->data.view_xx = me->xx + me->fx + gdata->data.fvx;
+      gdata->data.view_yy = me->yy + me->fy + gdata->data.fvy;
+      /* Look ahead (OM, 2026-10-05): slither's camera sits ahead of the
+         snake; off, the offset is zero. */
+      mobile_controls_look_ahead_step(env);
+      float ahead_x, ahead_y;
+      mobile_controls_look_ahead_offset(env, &ahead_x, &ahead_y);
+      if (gdata->data.gsc > 0.0f) {
+        gdata->data.view_xx += ahead_x / gdata->data.gsc;
+        gdata->data.view_yy += ahead_y / gdata->data.gsc;
+      }
+    }
+
+    gdata->data.bpx1 = gdata->data.view_xx - (mww2 / gdata->data.gsc + 84);
+    gdata->data.bpy1 = gdata->data.view_yy - (mhh2 / gdata->data.gsc + 84);
+    gdata->data.bpx2 = gdata->data.view_xx + (mww2 / gdata->data.gsc + 84);
+    gdata->data.bpy2 = gdata->data.view_yy + (mhh2 / gdata->data.gsc + 84);
+    gdata->data.fpx1 = gdata->data.view_xx - (mww2 / gdata->data.gsc + 24);
+    gdata->data.fpy1 = gdata->data.view_yy - (mhh2 / gdata->data.gsc + 24);
+    gdata->data.fpx2 = gdata->data.view_xx + (mww2 / gdata->data.gsc + 24);
+    gdata->data.fpy2 = gdata->data.view_yy + (mhh2 / gdata->data.gsc + 24);
+  }
+
+  // draw foods and preys:
+  int foods_len = tdarray_length(gdata->data.foods);
+  int preys_len = tdarray_length(gdata->data.preys);
+
+  float food_scale = mode->const_food_scale ? 1.0f : gdata->data.gsc;
+
+  if (mode->uniform_food_color) {
+    for (int i = foods_len - 1; i >= 0; i--) {
+      food* fo = gdata->data.foods + i;
+
+      if (usrs->hotkeys[HOTKEY_BIG_FOOD].active && fo->sz < 10) continue;
+
+      if (fo->rx >= gdata->data.fpx1 && fo->ry >= gdata->data.fpy1 &&
+          fo->rx <= gdata->data.fpx2 && fo->ry <= gdata->data.fpy2) {
+        float d = gdata->fsz[fo->cv2] * food_scale * fo->rad * mode->food_scale;
+        vec3s c = {mode->food_color[0], mode->food_color[1],
+                   mode->food_color[2]};
+
+        float fx =
+            mww2 + gdata->data.gsc * (fo->rx - gdata->data.view_xx) - d * 0.5;
+        float fy =
+            mhh2 + gdata->data.gsc * (fo->ry - gdata->data.view_yy) - d * 0.5;
+
+        fd_renderer_push(usr->r->fdr,
+                         &(fd_instance){{fx, fy, d},
+                                        (vec4s){c.r, c.g, c.b, fo->fr},
+                                        mode->food_flicker *
+                                            (.5 + .5 * cosf(fo->gfr / 13)),
+                                        food_shape(fo, mode->food_type)});
+      }
+    }
+  } else {
+    for (int i = foods_len - 1; i >= 0; i--) {
+      food* fo = gdata->data.foods + i;
+
+      if (usrs->hotkeys[HOTKEY_BIG_FOOD].active && fo->sz < 10) continue;
+
+      if (fo->rx >= gdata->data.fpx1 && fo->ry >= gdata->data.fpy1 &&
+          fo->rx <= gdata->data.fpx2 && fo->ry <= gdata->data.fpy2) {
+        float d = gdata->fsz[fo->cv2] * food_scale * fo->rad * mode->food_scale;
+        vec3s c = gdata->cg_colors[fo->cv];
+
+        float fx =
+            mww2 + gdata->data.gsc * (fo->rx - gdata->data.view_xx) - d * 0.5;
+        float fy =
+            mhh2 + gdata->data.gsc * (fo->ry - gdata->data.view_yy) - d * 0.5;
+
+        fd_renderer_push(usr->r->fdr,
+                         &(fd_instance){{fx, fy, d},
+                                        (vec4s){c.r, c.g, c.b, fo->fr},
+                                        mode->food_flicker *
+                                            (.5 + .5 * cosf(fo->gfr / 13)),
+                                        food_shape(fo, mode->food_type)});
+      }
+    }
+  }
+
+  for (int i = preys_len - 1; i >= 0; i--) {
+    prey* pr = gdata->data.preys + i;
+    float tx = pr->xx + pr->fx;
+    float ty = pr->yy + pr->fy;
+    float px = mww2 + gdata->data.gsc * (tx - gdata->data.view_xx);
+    float py = mhh2 + gdata->data.gsc * (ty - gdata->data.view_yy);
+    if (px >= -50 && py >= -50 && px <= mwwp50 && py <= mhhp50) {
+      if (pr->eaten) {
+        snake* o = get_snake(gdata, pr->ebid);
+        float k = powf(pr->eaten_fr, 2);
+        tx += (o->xx + o->fx + cosf(o->ang + o->fa) * (43 - k * 24) * (1 - k) -
+               tx) *
+              k;
+        ty += (o->yy + o->fy + sinf(o->ang + o->fa) * (43 - k * 24) * (1 - k) -
+               ty) *
+              k;
+        px = mww2 + gdata->data.gsc * (tx - gdata->data.view_xx);
+        py = mhh2 + gdata->data.gsc * (ty - gdata->data.view_yy);
+      }
+
+      float d = gdata->psz[pr->cv2] * gdata->data.gsc * pr->rad;
+      vec3s c = gdata->cg_colors[pr->cv];
+      float fx = px - d * 0.5f;
+      float fy = py - d * 0.5f;
+
+      fd_renderer_push_p(usr->r->fdr,
+                         &(fd_instance){{fx, fy, d},
+                                        (vec4s){c.r, c.g, c.b, pr->fr * 0.75f},
+                                        .5 + .5 * cosf(pr->gfr / 13), 0.0f});
+    }
+  }
+
+  // draw snakes:
+  int snakes_len = tdarray_length(gdata->data.snakes);
+  for (int i = snakes_len - 1; i >= 0; i--) {
+    snake* o = gdata->data.snakes + i;
+    int pts_len = tdarray_length(o->pts);
+    /* The head can enter before any stored body point crosses the edge. The
+       renderer still needs one body point before it can build the centreline. */
+    int iiv = pts_len > 0 &&
+              point_in_snake_view(gdata, o->xx + o->fx, o->yy + o->fy);
+
+    for (int j = pts_len - 1; !iiv && j >= 0; j--) {
+      body_part* po = o->pts + j;
+      float px = po->xx + po->fx;
+      float py = po->yy + po->fy;
+
+      if (point_in_snake_view(gdata, px, py)) {
+        iiv = true;
+      }
+    }
+    if (o->iiv != iiv) {
+      o->iiv = iiv;
+      if (iiv) o->ehang = o->wehang = o->ang;
+    }
+  }
+
+  igPushFont(
+      usr->imgui_data.mono_font[usrs->snake_names_font_size],
+      usr->imgui_data.mono_font[usrs->snake_names_font_size]->LegacySize);
+  ImFont* snake_name_font =
+      usr->imgui_data.mono_font[usrs->snake_names_font_size];
+#if !defined(__ANDROID__)
+  ImFont* snake_score_font =
+      usr->imgui_data.mono_font_bold[usrs->snake_names_font_size];
+  const float snake_name_font_size = snake_name_font->LegacySize;
+  ImDrawList* snake_name_draw_list =
+      igGetForegroundDrawList_ViewportPtr(igGetMainViewport());
+#endif
+#if defined(__ANDROID__) || defined(WYRM_MOBILE)
+  /* Names (OM, 2026-10-12): the font atlas is bound once for the whole snake
+     loop, so every name joins one draw command (the reference client draws them in one
+     batch; a push/pop per name made each its own). Direct world-space text
+     does not go through ImGui's widget path, and with the dynamic font atlas
+     this list can otherwise have an unrelated texture bound: Adreno then
+     samples the glyph UVs from it (opaque black strips behind remote snakes).
+     The spine, skinless strip and ImGui eyes in this loop use the atlas's
+     white pixel, so they want the atlas bound too. */
+  ImDrawList* name_draw_list = igGetWindowDrawList();
+  ImDrawList_PushTexture(name_draw_list,
+                         snake_name_font->ContainerAtlas->TexRef);
+  /* Names on any floor (OM, 2026-10-18): the floor picks the ink once. */
+  const float name_floor_luma = wyrm_floor_luma_now(env);
+#endif
+  for (int i = snakes_len - 1; i >= 0; i--) {
+    snake* o = gdata->data.snakes + i;
+    int sct = o->sct + o->rsc;
+
+    if (o->iiv) {
+      float hx = o->xx + o->fx;
+      float hy = o->yy + o->fy;
+      float px = hx;
+      float py = hy;
+      float a = o->alive_amt * (1 - o->dead_amt);
+
+      if (usrs->hotkeys[HOTKEY_SHOW_NAMES].active) {
+        int score = (int)floorf((gdata->data.fpsls[sct] +
+                                 o->fam / gdata->data.fmlts[sct] - 1) *
+                                    15 -
+                                5) /
+                    1;
+        score = GLM_MIN(GLM_MAX(score, 0), 999999);
+        double score_rep = score / 1000.0;
+        char nk_label_buff[MAX_NICKNAME_LEN + 1 + 7 + 1] = {0};
+        char score_rep_str[9] = {0};
+        sprintf(score_rep_str, " %.1fK", score_rep);
+        sprintf(nk_label_buff, "%s%s", o->nk, score_rep_str);
+
+        /* Your own name is skipped by default — you know what you called
+           yourself, and it would sit over the one snake you are already
+           looking at. Asked for by a player who wanted to find herself in a
+           crowd, which is the one moment it earns its space. */
+        if (o->id != gdata->data.snake_id || usrs->show_own_name) {
+          float ntx = o->xx + o->fx;
+          float nty = o->yy + o->fy;
+
+          ImVec2 tsize;
+          ImVec2 nsize;
+          igCalcTextSize(&nsize, o->nk, NULL, false, -1);
+          igCalcTextSize(&tsize, nk_label_buff, NULL, false, -1);
+
+          ntx = mww2 + (ntx - gdata->data.view_xx) * gdata->data.gsc;
+          nty = mhh2 + (nty - gdata->data.view_yy) * gdata->data.gsc;
+
+          vec3s* scolor =
+              gdata->cg_colors +
+              (o->cusk ? o->cusk_data[0] : gdata->default_skins[o->cv][1]);
+
+          vec3 ncolor;
+          glm_vec3_lerp((float*)scolor, (vec3){1, 1, 1},
+                        mode->player_names_outline ? 0.7f : 0.6f, ncolor);
+          vec3 lcolor;
+          glm_vec3_lerp((float*)scolor, (vec3){1, 1, 1},
+                        mode->player_names_outline ? 0.8f : 0.7f, lcolor);
+
+          ntx = ntx - (usrs->snake_scores ? tsize.x : nsize.x) * 0.5f;
+          nty = nty + 32 + 11 * o->sc * gdata->data.gsc;
+
+#if defined(__ANDROID__)
+          // The font atlas is bound once around the snake loop (above).
+          // The floor picks a light or dark ink, with a soft shadow of the
+          // other tone under it (OM, 2026-10-18).
+          {
+            ImU32 name_ink, name_shadow;
+            wyrm_name_inks(name_floor_luma, *scolor, a, &name_ink, &name_shadow);
+            if (o->id != gdata->data.snake_id &&
+                android_team_is_teammate(env, o->ntl_id, o->nk)) {
+              name_ink = igColorConvertFloat4ToU32((ImVec4){0.224f, 1.0f, 0.353f, a});
+              name_shadow = igColorConvertFloat4ToU32((ImVec4){0, 0, 0, 0.9f * a});
+            }
+            const char* label = usrs->snake_scores ? nk_label_buff : o->nk;
+            float size = snake_name_font->LegacySize;
+            float lift = size * 0.07f;
+            if (lift < 1.0f) lift = 1.0f;
+            ImDrawList_AddText_FontPtr(name_draw_list, snake_name_font, size,
+                                       (ImVec2){ntx + lift, nty + lift},
+                                       name_shadow, label, NULL, 0, NULL);
+            ImDrawList_AddText_FontPtr(name_draw_list, snake_name_font, size,
+                                       (ImVec2){ntx, nty}, name_ink, label,
+                                       NULL, 0, NULL);
+          }
+#else
+          if (mode->player_names_outline) {
+            const ImVec2 shadow_offsets[] = {
+                {-1.5f, 0}, {1.5f, 0}, {0, -1.5f}, {0, 1.5f}};
+            for (int shadow = 0; shadow < 4; shadow++) {
+              ImDrawList_AddText_FontPtr(
+                  snake_name_draw_list, snake_name_font, snake_name_font_size,
+                  (ImVec2){ntx + shadow_offsets[shadow].x,
+                           nty + shadow_offsets[shadow].y},
+                  igColorConvertFloat4ToU32((ImVec4){0, 0, 0, a}), o->nk, NULL,
+                  0, NULL);
+            }
+
+            if (usrs->snake_scores) {
+              for (int shadow = 0; shadow < 4; shadow++) {
+                ImDrawList_AddText_FontPtr(
+                    snake_name_draw_list, snake_score_font,
+                    snake_name_font_size,
+                    (ImVec2){ntx + nsize.x + shadow_offsets[shadow].x,
+                             nty + shadow_offsets[shadow].y},
+                    igColorConvertFloat4ToU32((ImVec4){0, 0, 0, a}),
+                    score_rep_str, NULL, 0, NULL);
+              }
+            }
+          }
+
+          ImDrawList_AddText_FontPtr(
+              snake_name_draw_list, snake_name_font, snake_name_font_size,
+              (ImVec2){ntx, nty},
+              igColorConvertFloat4ToU32(
+                  (ImVec4){ncolor[0], ncolor[1], ncolor[2],
+                           mode->player_names_outline ? a : 0.5f * a}),
+              o->nk, NULL, 0, NULL);
+
+          if (usrs->snake_scores) {
+            ImDrawList_AddText_FontPtr(
+                snake_name_draw_list, snake_score_font, snake_name_font_size,
+                (ImVec2){ntx + nsize.x, nty},
+                igColorConvertFloat4ToU32(
+                    (ImVec4){lcolor[0], lcolor[1], lcolor[2],
+                             mode->player_names_outline ? a : 0.7f * a}),
+                score_rep_str, NULL, 0, NULL);
+          }
+#endif
+        }
+      }
+
+      if (sct >= 2) {
+        float fang = o->ehang;
+        float ssc = o->sc;
+        float lsz = 29 * ssc;
+        float rl = o->cfl;
+        int pts_len = tdarray_length(o->pts);
+        int po_i = pts_len - 1;
+
+        lsz *= .5;
+        float ix1 = 0, iy1 = 0, ix2 = 0, iy2 = 0, ax1 = 0, ay1 = 0, ax2 = 0,
+              ay2 = 0, cx2 = 0, cy2 = 0, pax1 = 0, pay1 = 0;
+        int bp = 0;
+        px = hx;
+        py = hy;
+        ax2 = px;
+        ay2 = py;
+        float ax = px;
+        float ay = py;
+        bp = 0;
+        float px2 = 0, py2 = 0;
+        float px3 = 0, py3 = 0;
+        int po2_i = 0, po3_i = 0;
+        int lpo_i = 0;
+        float d = 0, d2 = 0;
+        float dx = 0, dy = 0;
+        float d3 = 0;
+        float tx = 0, ty = 0;
+        float ox = 0, oy = 0;
+        float rx = 0, ry = 0;
+        tx = 0;
+        ty = 0;
+        float j = 0, k = 0, l = 0, m = 0;
+        float j2 = 0;
+        float k2 = 0;
+        float irl = 0;
+        float wk = 0;
+        float wwk = 0;
+        float nkr = 0;
+        float msl = o->msl;
+        float mct = 6 / (mode->qsm * o->sep / 6.0f);
+
+        float omct = mct;
+        float rmct = 1 / mct;
+        float sep = msl / mct;
+        int ll = 0;
+        po_i = pts_len - 1;
+        px = o->pts[po_i].xx + o->pts[po_i].fx;
+        py = o->pts[po_i].yy + o->pts[po_i].fy;
+        d = sqrtf(powf(hx - px, 2) + powf(hy - py, 2));
+        dx = (hx - px) / d;
+        dy = (hy - py) / d;
+        nkr = d / msl;
+        int gpt_i, lgpt_i;
+        int gpt2_i, lgpt2_i;
+        int gpo_i;
+        int q = 0;
+        po3_i = pts_len - 2;
+        po2_i = pts_len - 1;
+        px = hx;
+        py = hy;
+        px2 = o->pts[po2_i].xx + o->pts[po2_i].fx;
+        py2 = o->pts[po2_i].yy + o->pts[po2_i].fy;
+
+        if (po3_i >= 0) {
+          px3 = o->pts[po3_i].xx + o->pts[po3_i].fx;
+          py3 = o->pts[po3_i].yy + o->pts[po3_i].fy;
+        }
+        if (d > msl) {
+          px = px2 + dx * msl;
+          py = py2 + dy * msl;
+        }
+        ax1 = px + (px2 - px) * .5;
+        ay1 = py + (py2 - py) * .5;
+        if (nkr < 1) {
+          ax1 += (px - ax1) * (1 - nkr);
+          ay1 += (py - ay1) * (1 - nkr);
+        }
+        ax2 = px3 + (px2 - px3) * .5;
+        ay2 = py3 + (py2 - py3) * .5;
+        d2 = sqrtf(powf(hx - ax1, 2) + powf(hy - ay1, 2));
+        k = sep;
+        m = 1;
+        gpt_i = arp(o, q, hx, hy);
+        q++;
+        o->gptz[gpt_i].d = 0;
+        lgpt_i = gpt_i;
+        wk++;
+        while (k < d2) {
+          tx = hx - m * dx * sep;
+          ty = hy - m * dy * sep;
+          gpt_i = arp(o, q, tx, ty);
+          q++;
+          d = sep;
+          o->gptz[gpt_i].d = d;
+          lgpt_i = gpt_i;
+          wk++;
+          if (ll == 1) {
+            ll = 2;
+            break;
+          }
+          rl -= rmct;
+          if (rl <= 0) {
+            ll = 1;
+            m += (rmct + rl) / rmct;
+            k += sep * (rmct + rl) / rmct;
+          } else {
+            m++;
+            k += sep;
+          }
+        }
+        irl = (k - d2) / msl;
+        if (ll <= 1) {
+          if (rl >= -1E-4 && rl <= 0) rl = 0;
+          if (rl >= 0 || ll == 1) {
+            if (nkr < 1) {
+              px2 += (ax2 - px2) * .5 * (1 - nkr);
+              py2 += (ay2 - py2) * .5 * (1 - nkr);
+            }
+            m = .5 + nkr - d2 / msl;
+            while (irl >= 0 && irl < m) {
+              k = irl / m;
+              ix1 = ax1 + (px2 - ax1) * k;
+              iy1 = ay1 + (py2 - ay1) * k;
+              ix2 = px2 + (ax2 - px2) * k;
+              iy2 = py2 + (ay2 - py2) * k;
+              rx = ix1 + (ix2 - ix1) * k;
+              ry = iy1 + (iy2 - iy1) * k;
+              gpt_i = arp(o, q, rx, ry);
+              q++;
+              d = sqrtf(powf(o->gptz[gpt_i].xx - o->gptz[lgpt_i].xx, 2) +
+                        powf(o->gptz[gpt_i].yy - o->gptz[lgpt_i].yy, 2));
+              o->gptz[gpt_i].d = d;
+              lgpt_i = gpt_i;
+              wk++;
+              if (ll == 1) {
+                ll = 2;
+                break;
+              }
+              rl -= rmct;
+              if (rl <= 0) {
+                ll = 1;
+                irl += rmct + rl;
+                rl = 0;
+              } else
+                irl += rmct;
+            }
+            irl -= m;
+          }
+          if (rl >= -1E-4 && rl <= 0) rl = 0;
+        }
+        int lj = tdarray_length(o->pts);
+        pts_len = tdarray_length(o->pts);
+        bool wsirl = false;
+        if (ll <= 1) {
+          wsirl = false;
+          if (rl >= 0 || ll == 1) {
+            float rmr = 0;
+            po_i = lj - 1;
+            for (j = pts_len - 1; j >= 2; j--) {
+              lj = j;
+              lpo_i = po_i;
+              po3_i = (int)(j - 2);
+              po2_i = (int)(j - 1);
+              po_i = (int)j;
+              px = o->pts[po_i].xx + o->pts[po_i].fx;
+              py = o->pts[po_i].yy + o->pts[po_i].fy;
+              px2 = o->pts[po2_i].xx + o->pts[po2_i].fx;
+              py2 = o->pts[po2_i].yy + o->pts[po2_i].fy;
+              px3 = o->pts[po3_i].xx + o->pts[po3_i].fx;
+              py3 = o->pts[po3_i].yy + o->pts[po3_i].fy;
+              ax1 = px + (px2 - px) * .5;
+              ay1 = py + (py2 - py) * .5;
+              ax2 = px2 + (px3 - px2) * .5;
+              ay2 = py2 + (py3 - py2) * .5;
+              m = o->pts[po_i].ltn + o->pts[po_i].fltn;
+              wwk = omct * 2 + 2;
+              if (o->pts[po_i].smu != o->pts[lpo_i].smu ||
+                  o->pts[po_i].fsmu != o->pts[lpo_i].fsmu) {
+                irl *= (o->pts[lpo_i].smu + o->pts[lpo_i].fsmu) /
+                       (o->pts[po_i].smu + o->pts[po_i].fsmu);
+                mct = omct * (o->pts[po_i].smu + o->pts[po_i].fsmu);
+                rmct = 1 / mct;
+                sep = msl / mct;
+              }
+              rl -= rmr * rmct;
+              while (irl < m) {
+                k = irl / m;
+                ix1 = ax1 + (px2 - ax1) * k;
+                iy1 = ay1 + (py2 - ay1) * k;
+                ix2 = px2 + (ax2 - px2) * k;
+                iy2 = py2 + (ay2 - py2) * k;
+                rx = ix1 + (ix2 - ix1) * k;
+                ry = iy1 + (iy2 - iy1) * k;
+                gpt_i = arp(o, q, rx, ry);
+                q++;
+                if (wk <= wwk) {
+                  d = sqrtf(powf(o->gptz[gpt_i].xx - o->gptz[lgpt_i].xx, 2) +
+                            powf(o->gptz[gpt_i].yy - o->gptz[lgpt_i].yy, 2));
+                  o->gptz[gpt_i].d = d;
+                  lgpt_i = gpt_i;
+                  wk++;
+                }
+                if (ll == 1) {
+                  ll = 2;
+                  j = -9999;
+                  break;
+                }
+                rl -= rmct;
+                if (rl <= 0) {
+                  ll = 1;
+                  irl += rmct + rl;
+                } else
+                  irl += rmct;
+              }
+              irl -= m;
+              rmr = irl / rmct;
+              rl += irl;
+              wsirl = true;
+            }
+          }
+          if (wsirl) rl -= irl;
+        }
+        if (ll <= 1) {
+          if (rl >= -1E-4 && rl <= 0) rl = 0;
+          if (rl >= 0 || ll == 1) {
+            po_i = (int)(lj - 1);
+            po2_i = (int)(lj - 2);
+            if (po_i >= 0) {
+              px = o->pts[po_i].xx + o->pts[po_i].fx;
+              py = o->pts[po_i].yy + o->pts[po_i].fy;
+            }
+            px2 = o->pts[po2_i].xx + o->pts[po2_i].fx;
+            py2 = o->pts[po2_i].yy + o->pts[po2_i].fy;
+            while (rl >= 0 || ll == 1) {
+              rx = px2 - (px - px2) * (irl - .5);
+              ry = py2 - (py - py2) * (irl - .5);
+              gpt_i = arp(o, q, rx, ry);
+              q++;
+              if (wk <= wwk) {
+                d = sqrtf(powf(o->gptz[gpt_i].xx - o->gptz[lgpt_i].xx, 2) +
+                          powf(o->gptz[gpt_i].yy - o->gptz[lgpt_i].yy, 2));
+                o->gptz[gpt_i].d = d;
+                lgpt_i = gpt_i;
+                wk++;
+              }
+              if (ll == 1) {
+                ll = 2;
+                j = -9999;
+                break;
+              }
+              rl -= rmct;
+              if (rl <= 0) {
+                ll = 1;
+                irl += rmct + rl;
+              } else
+                irl += rmct;
+              if (rl >= -1E-4 && rl <= 0) rl = 0;
+            }
+          }
+        }
+        k = wk - 1;
+        int gptz_len = tdarray_length(o->gptz);
+        if (k >= gptz_len) k = gptz_len;
+
+        if (k >= 3) {
+          d3 = 0;
+          for (j = 0; j < k - 1; j++) {
+            gpt_i = j;
+            d3 += o->gptz[gpt_i].d;
+          }
+          lgpt_i = 0;
+          lgpt2_i = 0;
+          m = d3 / (k - 2);
+          j = 1;
+          j2 = 1;
+          float v = m;
+          for (j = 0; j < k; j++) {
+            o->gptz[(int)j].ox = o->gptz[(int)j].xx;
+            o->gptz[(int)j].oy = o->gptz[(int)j].yy;
+          }
+          for (j = 1; j < k; j++) {
+            gpt_i = j;
+            while (true) {
+              gpt2_i = j2;
+              if (v < o->gptz[gpt2_i].d) {
+                o->gptz[gpt_i].xx = o->gptz[lgpt2_i].ox +
+                                    (o->gptz[gpt2_i].ox - o->gptz[lgpt2_i].ox) *
+                                        v / o->gptz[gpt2_i].d;
+                o->gptz[gpt_i].yy = o->gptz[lgpt2_i].oy +
+                                    (o->gptz[gpt2_i].oy - o->gptz[lgpt2_i].oy) *
+                                        v / o->gptz[gpt2_i].d;
+                o->gptz[gpt_i].xx +=
+                    (o->gptz[gpt_i].ox - o->gptz[gpt_i].xx) * powf(j / k, 2);
+                o->gptz[gpt_i].yy +=
+                    (o->gptz[gpt_i].oy - o->gptz[gpt_i].yy) * powf(j / k, 2);
+                v += m;
+                break;
+              } else {
+                v -= o->gptz[gpt2_i].d;
+                lgpt2_i = gpt2_i;
+                j2++;
+                if (j2 >= k) {
+                  j = k + 1;
+                  break;
+                }
+              }
+            }
+            lgpt_i = gpt_i;
+          }
+        }
+
+        float lpx = 0, lpy = 0;
+        for (j = 0; j < q; j++) {
+          px = o->gptz[(int)j].xx;
+          py = o->gptz[(int)j].yy;
+          gdata->data.pbx[bp] = px;
+          gdata->data.pby[bp] = py;
+          gdata->data.pba[bp] = 0;
+
+          /* pbu is scratch memory shared by every snake. Always overwrite it:
+             otherwise an off-screen point inherits the previous snake's 2,
+             fills the fixed sprite batch and makes body pieces flicker out. */
+          gdata->data.pbu[bp] = point_in_snake_view(gdata, px, py) ? 2 : 0;
+
+          if (bp >= 1) {
+            tx = px - lpx;
+            ty = py - lpy;
+            gdata->data.pba[bp] = atan2f(ty, tx);
+          }
+          lpx = px;
+          lpy = py;
+          bp++;
+        }
+
+        if (q >= 2) {
+          gdata->data.pba[0] = gdata->data.pba[1];
+          o->wehang = gdata->data.pba[1] + PI;
+        } else
+          o->wehang = o->ang;
+
+        float shsz = gdata->data.gsc * lsz * 1.5f;
+        a *= a;
+
+        const bool rope_mode =
+            WYRM_EXPERIMENTAL_ROPE_MODE &&
+            env->usr->mobile_hotkeys.rope_mode && o->id == gdata->data.snake_id;
+        if (rope_mode) draw_rope_backbone(env, o, bp, mww2, mhh2, a);
+
+        /* Wyrm skins (OM, 2026-10-13, wyrm_skins.c): a creature or strip look
+           takes the place of the beads, eyes, boost glow, tag and accessory.
+           Yours from your setting, everyone else's from their corner. */
+        const int wyrm_skin =
+            rope_mode ? 0
+            : o->id == gdata->data.snake_id ? user_settings_wyrm_skin(usrs)
+                                            : o->wyrm_skin;
+        if (wyrm_skin) {
+          float skin_r, skin_g, skin_b;
+          snake_strip_colour(env, o, &skin_r, &skin_g, &skin_b);
+          wyrm_skin_draw(wyrm_skin, gdata->data.pbx, gdata->data.pby,
+                         gdata->data.pbu, bp, gdata->data.view_xx,
+                         gdata->data.view_yy, gdata->data.gsc, mww2, mhh2, lsz,
+                         fang, o->wang, &o->wyrm_skin_look, o->tsp > o->fsp,
+                         o->alive_amt * (1 - o->dead_amt), skin_r, skin_g,
+                         skin_b);
+        } else if (!rope_mode) {
+          bool show_snake_shadows = mode->show_shadows;
+#if defined(WYRM_SDL_JNI)
+          // Dense private servers can put hundreds of tiny remote snakes in the
+          // viewport. Their four atlas-based desktop shadow stamps overlap into
+          // opaque black capsules on mobile GPUs. Keep the useful local-player
+          // depth cue while avoiding both the artifact and the extra overdraw.
+          show_snake_shadows =
+              show_snake_shadows && o->id == gdata->data.snake_id;
+#endif
+
+          /* Modes › Snake shadow (OM, 2026-10-09), normal and assist apart.
+             Not under a skinless strip, which is meant to be see-through. */
+          const bool air_shadow =
+              usrs->ext.snake_shadow[usrs->hotkeys[HOTKEY_ASSIST].active ? 1 : 0] &&
+              mode->render_mode != 3;
+          const float air_half =
+              gdata->data.gsc * lsz * APPLE_AIR_SHADOW_SCALE;
+          float air_sx = 31337357, air_sy = 31337357;
+
+          float om = 0;
+          float mr = 0;
+
+          if (mode->render_mode == 0) {
+            float shadow_strength = 0.25f;
+
+            /* Wyrm: AIR draws `ksmc_t` beneath every Build-a-Slither
+               bead — the head's first nine fading out, then the tail's last
+               four; the rest interleave with the body below, four points
+               behind, exactly as AIR's redraw does. */
+            const float apple_air_half =
+                gdata->data.gsc * lsz * APPLE_AIR_SHADOW_SCALE;
+            bool apple_air_any = false;
+            for (int s = 0; WYRM_AIR_BEAD_SHADOW && o->cusk && s < o->cusk_len && !apple_air_any; ++s)
+              apple_air_any = apple_air_kind_at(env, o, s) >= 0;
+            float apple_air_sx = 31337357, apple_air_sy = 31337357;
+            if (apple_air_any) {
+              for (int p = bp - 1 < 8 ? bp - 1 : 8; p >= 0; p--)
+                if (gdata->data.pbu[p] == 2 && apple_air_kind_at(env, o, p) >= 0)
+                  apple_air_shadow(env, p, apple_air_half, a * (1 - p / 9.0f),
+                                   mww2, mhh2);
+              for (int n = 1; n <= 4; ++n) {
+                int p = bp - n;
+                if (p < 0 || gdata->data.pbu[p] != 2 ||
+                    apple_air_kind_at(env, o, p) < 0)
+                  continue;
+                float spacing =
+                    apple_air_spacing(env, p, &apple_air_sx, &apple_air_sy);
+                if (n == 1) spacing = 1;
+                apple_air_shadow(env, p, apple_air_half,
+                                 spacing * a * (p < 9 ? p / 9.0f : 1), mww2,
+                                 mhh2);
+              }
+            }
+
+            if (air_shadow)
+              air_snake_shadow_ends(env, bp, air_half, a, mww2, mhh2, &air_sx,
+                                    &air_sy);
+            else if (show_snake_shadows) {
+              // draw last 4 body parts' shadow:
+              int start = bp >= 4 ? bp - 4 : 0;
+              for (j = start; j < bp; j++) {
+                if (gdata->data.pbu[(int)j] >= 1 &&
+                    !(apple_air_any && apple_air_kind_at(env, o, (int)j) >= 0)) {
+                  px = gdata->data.pbx[(int)j];
+                  py = gdata->data.pby[(int)j];
+
+                  float fix =
+                      ((px - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                  float fiy =
+                      ((py - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                  bp_renderer_push(
+                      usr->r->bpr,
+                      &(bp_instance){{fix - shsz, fiy - shsz, 2 * shsz,
+                                      gdata->data.pba[(int)j]},
+                                     gdata->SHADOW_UV,
+                                     {0, 0, 0, shadow_strength * a}});
+                }
+              }
+            }
+
+            // draw body parts:
+            if (o->cusk) {
+              for (j = bp - 1; j >= 0; j--)
+                if (gdata->data.pbu[(int)j] >= 1) {
+                  px = gdata->data.pbx[(int)j];
+                  py = gdata->data.pby[(int)j];
+
+                  if (j >= 4 && apple_air_any &&
+                      apple_air_kind_at(env, o, (int)j - 4) >= 0) {
+                    int p = (int)j - 4;
+                    if (gdata->data.pbu[p] == 2) {
+                      float spacing = apple_air_spacing(env, p, &apple_air_sx,
+                                                        &apple_air_sy);
+                      apple_air_shadow(env, p, apple_air_half,
+                                       spacing * a * (p < 9 ? p / 9.0f : 1),
+                                       mww2, mhh2);
+                    }
+                  } else if (air_shadow) {
+                    air_snake_shadow_behind(env, (int)j, air_half, a, mww2, mhh2,
+                                            &air_sx, &air_sy);
+                  } else if (j >= 4 && show_snake_shadows) {
+                    k = j - 4;
+                    if (gdata->data.pbu[(int)k] == 2) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)k];
+                      ty = gdata->data.pby[(int)k];
+                      float fix =
+                          ((tx - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                      float fiy =
+                          ((ty - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                      bp_renderer_push(
+                          usr->r->bpr,
+                          &(bp_instance){{fix - shsz, fiy - shsz, 2 * shsz,
+                                          gdata->data.pba[(int)j]},
+                                         gdata->SHADOW_UV,
+                                         {0, 0, 0, shadow_strength * a}});
+                    }
+                  }
+
+                  float fix =
+                      ((px - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                  float fiy =
+                      ((py - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                  int slot = studio_slot(env, o, (int)j, o->cusk_len);
+                  int cg_id = o->cusk_data[(int)j % o->cusk_len];
+                  uint32_t built = built_skin_rgba(env, o, slot);
+
+                  if (studio_own(env, o))
+                    bp_renderer_push(
+                        usr->r->bpr,
+                        &(bp_instance){
+                            {fix - (gdata->data.gsc * lsz),
+                             fiy - (gdata->data.gsc * lsz),
+                             gdata->data.gsc * 2 * lsz, gdata->data.pba[(int)j]},
+                            studio_cell_uv(studio_cell_at(slot)),
+                            {1, 1, 1, a}});
+                  else
+                  bp_renderer_push(
+                      usr->r->bpr,
+                      &(bp_instance){
+                          {fix - (gdata->data.gsc * lsz),
+                           fiy - (gdata->data.gsc * lsz),
+                           gdata->data.gsc * 2 * lsz, gdata->data.pba[(int)j]},
+                          /* A mixed colour is not in the atlas, so a built
+                           * point drops to the blank bead and is tinted. */
+                          wyrm_bead_kind(built) >= 0
+                              ? wyrm_bead_uv(wyrm_bead_kind(built))
+                          : apple_air_kind(built) >= 0
+                              ? apple_air_bead_uv(apple_air_kind(built))
+                          : built ? gdata->cg_uvs[BLANK_UV]
+                                  : gdata->cg_uvs[cg_id],
+                          wyrm_bead_kind(built) >= 0
+                              ? wyrm_bead_color(built, wyrm_bead_kind(built), a)
+                          : apple_air_kind(built) >= 0
+                              ? apple_air_tint(built, a)
+                          : built ? built_skin_color(built, a)
+                                  : (vec4s){{1, 1, 1, a}}});
+                }
+            } else {
+              for (j = bp - 1; j >= 0; j--)
+                if (gdata->data.pbu[(int)j] >= 1) {
+                  px = gdata->data.pbx[(int)j];
+                  py = gdata->data.pby[(int)j];
+
+                  if (air_shadow) {
+                    air_snake_shadow_behind(env, (int)j, air_half, a, mww2, mhh2,
+                                            &air_sx, &air_sy);
+                  } else if (j >= 4 && show_snake_shadows) {
+                    k = j - 4;
+                    if (gdata->data.pbu[(int)k] == 2) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)k];
+                      ty = gdata->data.pby[(int)k];
+                      float fix =
+                          ((tx - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                      float fiy =
+                          ((ty - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                      bp_renderer_push(
+                          usr->r->bpr,
+                          &(bp_instance){{fix - shsz, fiy - shsz, 2 * shsz,
+                                          gdata->data.pba[(int)j]},
+                                         gdata->SHADOW_UV,
+                                         {0, 0, 0, shadow_strength * a}});
+                    }
+                  }
+
+                  float fix =
+                      ((px - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                  float fiy =
+                      ((py - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                  int default_skin_len = gdata->default_skins[o->cv][0];
+                  int cg_id =
+                      gdata->default_skins[o->cv]
+                                          [1 + ((int)j % default_skin_len)];
+                  float se = gdata->worm_effect[(int)j % WORM_EFFECT_LEN];
+
+                  bp_renderer_push(
+                      usr->r->bpr,
+                      &(bp_instance){
+                          {fix - (gdata->data.gsc * lsz),
+                           fiy - (gdata->data.gsc * lsz),
+                           gdata->data.gsc * 2 * lsz, gdata->data.pba[(int)j]},
+                          gdata->cg_uvs[cg_id],
+                          {se, se, se, a}});
+                }
+            }
+          } else if (mode->render_mode == 1) {
+            if (air_shadow)
+              air_snake_shadow_ends(env, bp, air_half, a, mww2, mhh2, &air_sx,
+                                    &air_sy);
+            else if (show_snake_shadows) {
+              // draw last 4 body parts' shadow:
+              int start = bp >= 4 ? bp - 4 : 0;
+              for (j = start; j < bp; j++) {
+                if (gdata->data.pbu[(int)j] >= 1) {
+                  px = gdata->data.pbx[(int)j];
+                  py = gdata->data.pby[(int)j];
+
+                  float fix =
+                      ((px - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                  float fiy =
+                      ((py - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                  bp_renderer_push(
+                      usr->r->bpr,
+                      &(bp_instance){{fix - (lsz * gdata->data.gsc + 1),
+                                      fiy - (lsz * gdata->data.gsc + 1),
+                                      (lsz * gdata->data.gsc + 1) * 2,
+                                      gdata->data.pba[(int)j]},
+                                     gdata->cg_uvs[BLANK_UV],
+                                     {0, 0, 0, a * a}});
+                }
+              }
+            }
+
+            // draw body parts:
+            if (o->cusk) {
+              for (j = bp - 1; j >= 0; j--)
+                if (gdata->data.pbu[(int)j] >= 1) {
+                  px = gdata->data.pbx[(int)j];
+                  py = gdata->data.pby[(int)j];
+
+                  if (air_shadow) {
+                    air_snake_shadow_behind(env, (int)j, air_half, a, mww2, mhh2,
+                                            &air_sx, &air_sy);
+                  } else if (j >= 4 && show_snake_shadows) {
+                    k = j - 4;
+                    if (gdata->data.pbu[(int)k] == 2) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)k];
+                      ty = gdata->data.pby[(int)k];
+                      float fix =
+                          ((tx - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                      float fiy =
+                          ((ty - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                      bp_renderer_push(
+                          usr->r->bpr,
+                          &(bp_instance){{fix - (lsz * gdata->data.gsc + 1),
+                                          fiy - (lsz * gdata->data.gsc + 1),
+                                          (lsz * gdata->data.gsc + 1) * 2,
+                                          gdata->data.pba[(int)j]},
+                                         gdata->cg_uvs[BLANK_UV],
+                                         {0, 0, 0, a * a}});
+                    }
+                  }
+
+                  float fix =
+                      ((px - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                  float fiy =
+                      ((py - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                  int slot = studio_slot(env, o, (int)j, o->cusk_len);
+                  int cg_id = o->cusk_data[(int)j % o->cusk_len];
+                  vec3s* cg_col = gdata->cg_colors + cg_id;
+                  uint32_t built = built_skin_rgba(env, o, slot);
+
+                  bp_renderer_push(
+                      usr->r->bpr,
+                      &(bp_instance){
+                          {fix - (gdata->data.gsc * lsz),
+                           fiy - (gdata->data.gsc * lsz),
+                           gdata->data.gsc * 2 * lsz, gdata->data.pba[(int)j]},
+                          gdata->cg_uvs[BLANK_UV],
+                          built ? built_skin_color(built, a)
+                                : (vec4s){{cg_col->r, cg_col->g, cg_col->b, a}}});
+                }
+            } else {
+              for (j = bp - 1; j >= 0; j--)
+                if (gdata->data.pbu[(int)j] >= 1) {
+                  px = gdata->data.pbx[(int)j];
+                  py = gdata->data.pby[(int)j];
+
+                  if (air_shadow) {
+                    air_snake_shadow_behind(env, (int)j, air_half, a, mww2, mhh2,
+                                            &air_sx, &air_sy);
+                  } else if (j >= 4 && show_snake_shadows) {
+                    k = j - 4;
+                    if (gdata->data.pbu[(int)k] == 2) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)k];
+                      ty = gdata->data.pby[(int)k];
+                      float fix =
+                          ((tx - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                      float fiy =
+                          ((ty - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                      bp_renderer_push(
+                          usr->r->bpr,
+                          &(bp_instance){{fix - (lsz * gdata->data.gsc + 1),
+                                          fiy - (lsz * gdata->data.gsc + 1),
+                                          (lsz * gdata->data.gsc + 1) * 2,
+                                          gdata->data.pba[(int)j]},
+                                         gdata->cg_uvs[BLANK_UV],
+                                         {0, 0, 0, a * a}});
+                    }
+                  }
+
+                  float fix =
+                      ((px - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                  float fiy =
+                      ((py - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                  int default_skin_len = gdata->default_skins[o->cv][0];
+                  int cg_id =
+                      gdata->default_skins[o->cv]
+                                          [1 + ((int)j % default_skin_len)];
+                  vec3s* cg_col = gdata->cg_colors + cg_id;
+
+                  bp_renderer_push(
+                      usr->r->bpr,
+                      &(bp_instance){
+                          {fix - (gdata->data.gsc * lsz),
+                           fiy - (gdata->data.gsc * lsz),
+                           gdata->data.gsc * 2 * lsz, gdata->data.pba[(int)j]},
+                          gdata->cg_uvs[BLANK_UV],
+                          {cg_col->r, cg_col->g, cg_col->b, a}});
+                }
+            }
+          } else if (mode->render_mode == 2) {
+            if (air_shadow)
+              air_snake_shadow_ends(env, bp, air_half, a, mww2, mhh2, &air_sx,
+                                    &air_sy);
+            else if (show_snake_shadows) {
+              // draw last 4 body parts' shadow:
+              int start = bp >= 4 ? bp - 4 : 0;
+              for (j = start; j < bp; j++) {
+                if (gdata->data.pbu[(int)j] >= 1) {
+                  px = gdata->data.pbx[(int)j];
+                  py = gdata->data.pby[(int)j];
+
+                  float fix =
+                      ((px - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                  float fiy =
+                      ((py - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                  bp_renderer_push(
+                      usr->r->bpr,
+                      &(bp_instance){{fix - (lsz * gdata->data.gsc + 1),
+                                      fiy - (lsz * gdata->data.gsc + 1),
+                                      (lsz * gdata->data.gsc + 1) * 2,
+                                      gdata->data.pba[(int)j]},
+                                     gdata->cg_uvs[BLANK_UV],
+                                     {0, 0, 0, a * a}});
+                }
+              }
+            }
+
+            // draw body parts:
+            if (o->cusk) {
+              for (j = bp - 1; j >= 0; j--)
+                if (gdata->data.pbu[(int)j] >= 1) {
+                  px = gdata->data.pbx[(int)j];
+                  py = gdata->data.pby[(int)j];
+
+                  if (air_shadow) {
+                    air_snake_shadow_behind(env, (int)j, air_half, a, mww2, mhh2,
+                                            &air_sx, &air_sy);
+                  } else if (j >= 4 && show_snake_shadows) {
+                    k = j - 4;
+                    if (gdata->data.pbu[(int)k] == 2) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)k];
+                      ty = gdata->data.pby[(int)k];
+                      float fix =
+                          ((tx - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                      float fiy =
+                          ((ty - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                      bp_renderer_push(
+                          usr->r->bpr,
+                          &(bp_instance){{fix - (lsz * gdata->data.gsc + 1),
+                                          fiy - (lsz * gdata->data.gsc + 1),
+                                          (lsz * gdata->data.gsc + 1) * 2,
+                                          gdata->data.pba[(int)j]},
+                                         gdata->cg_uvs[BLANK_UV],
+                                         {0, 0, 0, a * a}});
+                    }
+                  }
+
+                  float fix =
+                      ((px - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                  float fiy =
+                      ((py - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                  int cg_id = o->cusk_data[0];
+                  vec3s* cg_col = gdata->cg_colors + cg_id;
+                  uint32_t built = built_skin_rgba(env, o, 0);
+
+                  bp_renderer_push(
+                      usr->r->bpr,
+                      &(bp_instance){
+                          {fix - (gdata->data.gsc * lsz),
+                           fiy - (gdata->data.gsc * lsz),
+                           gdata->data.gsc * 2 * lsz, gdata->data.pba[(int)j]},
+                          gdata->cg_uvs[BLANK_UV],
+                          built
+                              ? built_skin_color(built, a * a)
+                              : (vec4s){{cg_col->r, cg_col->g, cg_col->b, a * a}}});
+                }
+            } else {
+              for (j = bp - 1; j >= 0; j--)
+                if (gdata->data.pbu[(int)j] >= 1) {
+                  px = gdata->data.pbx[(int)j];
+                  py = gdata->data.pby[(int)j];
+
+                  if (air_shadow) {
+                    air_snake_shadow_behind(env, (int)j, air_half, a, mww2, mhh2,
+                                            &air_sx, &air_sy);
+                  } else if (j >= 4 && show_snake_shadows) {
+                    k = j - 4;
+                    if (gdata->data.pbu[(int)k] == 2) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)k];
+                      ty = gdata->data.pby[(int)k];
+                      float fix =
+                          ((tx - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                      float fiy =
+                          ((ty - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                      bp_renderer_push(
+                          usr->r->bpr,
+                          &(bp_instance){{fix - (lsz * gdata->data.gsc + 1),
+                                          fiy - (lsz * gdata->data.gsc + 1),
+                                          (lsz * gdata->data.gsc + 1) * 2,
+                                          gdata->data.pba[(int)j]},
+                                         gdata->cg_uvs[BLANK_UV],
+                                         {0, 0, 0, a}});
+                    }
+                  }
+
+                  float fix =
+                      ((px - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                  float fiy =
+                      ((py - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                  int default_skin_len = gdata->default_skins[o->cv][0];
+                  int cg_id = gdata->default_skins[o->cv][1];
+                  vec3s* cg_col = gdata->cg_colors + cg_id;
+
+                  bp_renderer_push(
+                      usr->r->bpr,
+                      &(bp_instance){
+                          {fix - (gdata->data.gsc * lsz),
+                           fiy - (gdata->data.gsc * lsz),
+                           gdata->data.gsc * 2 * lsz, gdata->data.pba[(int)j]},
+                          gdata->cg_uvs[BLANK_UV],
+                          {cg_col->r, cg_col->g, cg_col->b, a}});
+                }
+            }
+          } else if (mode->render_mode == 3) {
+            /* Skinless: the plain body's width and length, skin see-through. */
+            draw_skinless_strip(env, o, bp, mww2, mhh2, lsz, a);
+          }
+
+          // debugging
+          // for (int bpi = pts_len - 1; bpi >= 0; bpi--) {
+          //   body_part* po = o->pts + bpi;
+          //   float fix = ((po->xx - gdata->data.view_xx) * gdata->data.gsc) +
+          //   mww2; float fiy = ((po->yy - gdata->data.view_yy) *
+          //   gdata->data.gsc) + mhh2;
+
+          //   ImDrawList_AddCircleFilled(igGetWindowDrawList(), (ImVec2){fix,
+          //   fiy}, 5, UINT32_MAX, 10);
+          // }
+
+          // if (o->id == gdata->data.snake_id) {
+          //   ImDrawList_AddLine(igGetWindowDrawList(), (ImVec2){mww2, mhh2},
+          //   (ImVec2){mww2 + 120 * cosf(o->ang), mhh2 + 120 * sinf(o->ang)},
+          //   igColorConvertFloat4ToU32((ImVec4){1, 0, 0, 1}), 2);
+          //   ImDrawList_AddLine(igGetWindowDrawList(), (ImVec2){mww2, mhh2},
+          //   (ImVec2){mww2 + 120 * cosf(o->wang), mhh2 + 120 * sinf(o->wang)},
+          //   igColorConvertFloat4ToU32((ImVec4){0, 1, 0, 1}), 2);
+          //   ImDrawList_AddLine(igGetWindowDrawList(), (ImVec2){mww2, mhh2},
+          //   (ImVec2){mww2 + 120 * cosf(o->pts[pts_len - 1].iang), mhh2 + 120
+          //   * sinf(o->pts[pts_len - 1].iang)},
+          //   igColorConvertFloat4ToU32((ImVec4){0.3f, 0.3f, 1, 1}), 2);
+          // }
+
+          if (mode->death_effect && o->dead) {
+            float falf = (.15 + .15 * fabsf(sinf(5 * PI * o->dead_amt))) *
+                         sinf(PI * o->dead_amt);
+            float dsz = gdata->data.gsc * lsz;
+
+            for (j = bp - 1; j >= 0; j--)
+              if (gdata->data.pbu[(int)j] == 2) {
+                ox = tx;
+                oy = ty;
+                tx = gdata->data.pbx[(int)j];
+                ty = gdata->data.pby[(int)j];
+                if (tx > ox)
+                  d2 = tx - ox;
+                else
+                  d2 = ox - tx;
+                if (ty > oy)
+                  d2 += ty - oy;
+                else
+                  d2 += oy - ty;
+                d2 /= 6;
+                if (d2 > 1) d2 = 1;
+                px = gdata->data.pbx[(int)j];
+                py = gdata->data.pby[(int)j];
+                float alpha =
+                    d2 * falf * (.6 + .4 * cosf(j / 4 - 15 * o->dead_amt));
+
+                float fix =
+                    ((px - gdata->data.view_xx) * gdata->data.gsc) + mww2;
+                float fiy =
+                    ((py - gdata->data.view_yy) * gdata->data.gsc) + mhh2;
+
+                bp_renderer_push(
+                    usr->r->bpr,
+                    &(bp_instance){{fix - dsz, fiy - dsz, dsz * 2, 0},
+                                   gdata->cg_uvs[BLANK_UV],
+                                   {1, 1, 1, alpha * 0.5f}});
+              }
+          }
+
+          /* Show boost on (OM, 2026-10-18): only mine, or every snake's. */
+          if (mode->show_boost && mode->render_mode != 3 &&
+              (!usrs->ext.boost_own[mode == usrs->modes ? 0 : 1] ||
+               o->id == gdata->data.snake_id)) {
+            if (mode->render_mode == 2) {
+              if (o->tsp > o->fsp) {
+                m = a *
+                    fmaxf(0, fminf(1, (o->tsp - o->ssp) / (o->msp - o->ssp)));
+                om = m * .37;
+                mr = powf(m, .5);
+                float glsz =
+                    (0.7f + 0.5f * mode->boost_type + 0.6f * mr) * gdata->data.gsc * lsz;
+                float strength = (1 + mode->boost_type * WYRM_BOOST_SIMPLE) * WYRM_BOOST_ALPHA;
+
+                if (o->cusk) {
+                  for (j = bp - 1; j >= 0; j--)
+                    if (gdata->data.pbu[(int)j] == 2 && ((int)j % WYRM_BOOST_STRIDE) == 0) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)j];
+                      ty = gdata->data.pby[(int)j];
+                      if (tx > ox)
+                        d2 = tx - ox;
+                      else
+                        d2 = ox - tx;
+                      if (ty > oy)
+                        d2 += ty - oy;
+                      else
+                        d2 += oy - ty;
+                      d2 /= 6;
+                      if (d2 > 1) d2 = 1;
+
+                      float fix =
+                          (tx - gdata->data.view_xx) * gdata->data.gsc + mww2;
+                      float fiy =
+                          (ty - gdata->data.view_yy) * gdata->data.gsc + mhh2;
+
+                      float alpha = strength * d2 * a * mr * .38 *
+                                    (.6 + .4 * cosf(j / 4 - 1.15 * o->sfr));
+                      int cg_id = o->cusk_data[0];
+                      vec3s studio_glow;
+                      vec3s* shc = studio_glow_for(env, o, 0, &studio_glow,
+                                                   gdata->cg_glow_colors + cg_id);
+
+                      bst_renderer_push(
+                          usr->r->bstb,
+                          &(bst_instance){{fix - glsz, fiy - glsz, 2 * glsz},
+                                          {shc->r, shc->g, shc->b, alpha}});
+                    }
+                } else {
+                  for (j = bp - 1; j >= 0; j--)
+                    if (gdata->data.pbu[(int)j] == 2 && ((int)j % WYRM_BOOST_STRIDE) == 0) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)j];
+                      ty = gdata->data.pby[(int)j];
+                      if (tx > ox)
+                        d2 = tx - ox;
+                      else
+                        d2 = ox - tx;
+                      if (ty > oy)
+                        d2 += ty - oy;
+                      else
+                        d2 += oy - ty;
+                      d2 /= 6;
+                      if (d2 > 1) d2 = 1;
+
+                      float fix =
+                          (tx - gdata->data.view_xx) * gdata->data.gsc + mww2;
+                      float fiy =
+                          (ty - gdata->data.view_yy) * gdata->data.gsc + mhh2;
+
+                      float alpha = strength * d2 * a * mr * .38 *
+                                    (.6 + .4 * cosf(j / 4 - 1.15 * o->sfr));
+
+                      int default_skin_len = gdata->default_skins[o->cv][0];
+                      int cg_id = gdata->default_skins[o->cv][1];
+                      vec3s* shc = gdata->cg_glow_colors + cg_id;
+
+                      bst_renderer_push(
+                          usr->r->bstb,
+                          &(bst_instance){{fix - glsz, fiy - glsz, 2 * glsz},
+                                          {shc->r, shc->g, shc->b, alpha}});
+                    }
+                }
+              }
+              // boost effect 2:
+              if (mode->boost_type == 0 && o->tsp > o->fsp) {
+                float glsz = lsz * WYRM_BOOST_WIDE * gdata->data.gsc;
+                float strength = 0.7f * WYRM_BOOST_SIMPLE;
+
+                if (o->cusk) {
+                  for (j = bp - 1; j >= 0; j--)
+                    if (gdata->data.pbu[(int)j] == 2 && ((int)j % WYRM_BOOST_STRIDE) == 0) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)j];
+                      ty = gdata->data.pby[(int)j];
+                      if (tx > ox)
+                        d2 = tx - ox;
+                      else
+                        d2 = ox - tx;
+                      if (ty > oy)
+                        d2 += ty - oy;
+                      else
+                        d2 += oy - ty;
+                      d2 /= 6;
+                      if (d2 > 1) d2 = 1;
+
+                      float fix =
+                          (tx - gdata->data.view_xx) * gdata->data.gsc + mww2;
+                      float fiy =
+                          (ty - gdata->data.view_yy) * gdata->data.gsc + mhh2;
+
+                      float alpha = strength * d2 * a * om *
+                                    (.5 + .5 * cosf(j / 4 - o->sfr));
+                      int cg_id = o->cusk_data[0];
+                      vec3s studio_glow;
+                      vec3s* shc = studio_glow_for(env, o, 0, &studio_glow,
+                                                   gdata->cg_glow_colors + cg_id);
+
+                      bst_renderer_push(
+                          usr->r->bsta,
+                          &(bst_instance){{fix - glsz, fiy - glsz, 2 * glsz},
+                                          {shc->r, shc->g, shc->b, alpha}});
+                    }
+                } else {
+                  for (j = bp - 1; j >= 0; j--)
+                    if (gdata->data.pbu[(int)j] == 2 && ((int)j % WYRM_BOOST_STRIDE) == 0) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)j];
+                      ty = gdata->data.pby[(int)j];
+                      if (tx > ox)
+                        d2 = tx - ox;
+                      else
+                        d2 = ox - tx;
+                      if (ty > oy)
+                        d2 += ty - oy;
+                      else
+                        d2 += oy - ty;
+                      d2 /= 6;
+                      if (d2 > 1) d2 = 1;
+
+                      float fix =
+                          (tx - gdata->data.view_xx) * gdata->data.gsc + mww2;
+                      float fiy =
+                          (ty - gdata->data.view_yy) * gdata->data.gsc + mhh2;
+
+                      float alpha = strength * d2 * a * om *
+                                    (.5 + .5 * cosf(j / 4 - o->sfr));
+
+                      int default_skin_len = gdata->default_skins[o->cv][0];
+                      int cg_id = gdata->default_skins[o->cv][1];
+                      vec3s* shc = gdata->cg_glow_colors + cg_id;
+
+                      bst_renderer_push(
+                          usr->r->bsta,
+                          &(bst_instance){{fix - glsz, fiy - glsz, 2 * glsz},
+                                          {shc->r, shc->g, shc->b, alpha}});
+                    }
+                }
+              }
+            } else {
+              // boost effect 1:
+              if (o->tsp > o->fsp) {
+                m = a *
+                    fmaxf(0, fminf(1, (o->tsp - o->ssp) / (o->msp - o->ssp)));
+                om = m * .37;
+                mr = powf(m, .5);
+                float glsz =
+                    (0.7f + 0.5f * mode->boost_type + 0.6f * mr) * gdata->data.gsc * lsz;
+                float strength = (1 + mode->boost_type * WYRM_BOOST_SIMPLE) * WYRM_BOOST_ALPHA;
+
+                if (o->cusk) {
+                  for (j = bp - 1; j >= 0; j--)
+                    if (gdata->data.pbu[(int)j] == 2 && ((int)j % WYRM_BOOST_STRIDE) == 0) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)j];
+                      ty = gdata->data.pby[(int)j];
+                      if (tx > ox)
+                        d2 = tx - ox;
+                      else
+                        d2 = ox - tx;
+                      if (ty > oy)
+                        d2 += ty - oy;
+                      else
+                        d2 += oy - ty;
+                      d2 /= 6;
+                      if (d2 > 1) d2 = 1;
+
+                      float fix =
+                          (tx - gdata->data.view_xx) * gdata->data.gsc + mww2;
+                      float fiy =
+                          (ty - gdata->data.view_yy) * gdata->data.gsc + mhh2;
+
+                      float alpha = strength * d2 * a * mr * .38 *
+                                    (.6 + .4 * cosf(j / 4 - 1.15 * o->sfr));
+                      int cg_id = o->cusk_data[(int)j % o->cusk_len];
+                      vec3s studio_glow;
+                      vec3s* shc = studio_glow_for(env, o, (int)j, &studio_glow,
+                                                   gdata->cg_glow_colors + cg_id);
+
+                      bst_renderer_push(
+                          usr->r->bstb,
+                          &(bst_instance){{fix - glsz, fiy - glsz, 2 * glsz},
+                                          {shc->r, shc->g, shc->b, alpha}});
+                    }
+                } else {
+                  for (j = bp - 1; j >= 0; j--)
+                    if (gdata->data.pbu[(int)j] == 2 && ((int)j % WYRM_BOOST_STRIDE) == 0) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)j];
+                      ty = gdata->data.pby[(int)j];
+                      if (tx > ox)
+                        d2 = tx - ox;
+                      else
+                        d2 = ox - tx;
+                      if (ty > oy)
+                        d2 += ty - oy;
+                      else
+                        d2 += oy - ty;
+                      d2 /= 6;
+                      if (d2 > 1) d2 = 1;
+
+                      float fix =
+                          (tx - gdata->data.view_xx) * gdata->data.gsc + mww2;
+                      float fiy =
+                          (ty - gdata->data.view_yy) * gdata->data.gsc + mhh2;
+
+                      float alpha = strength * d2 * a * mr * .38 *
+                                    (.6 + .4 * cosf(j / 4 - 1.15 * o->sfr));
+
+                      int default_skin_len = gdata->default_skins[o->cv][0];
+                      int cg_id =
+                          gdata->default_skins[o->cv]
+                                              [1 + ((int)j % default_skin_len)];
+                      vec3s* shc = gdata->cg_glow_colors + cg_id;
+
+                      bst_renderer_push(
+                          usr->r->bstb,
+                          &(bst_instance){{fix - glsz, fiy - glsz, 2 * glsz},
+                                          {shc->r, shc->g, shc->b, alpha}});
+                    }
+                }
+              }
+              // boost effect 2:
+              if (mode->boost_type == 0 && o->tsp > o->fsp) {
+                float glsz = lsz * WYRM_BOOST_WIDE * gdata->data.gsc;
+                float strength = 0.7f * WYRM_BOOST_SIMPLE;
+
+                if (o->cusk) {
+                  for (j = bp - 1; j >= 0; j--)
+                    if (gdata->data.pbu[(int)j] == 2 && ((int)j % WYRM_BOOST_STRIDE) == 0) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)j];
+                      ty = gdata->data.pby[(int)j];
+                      if (tx > ox)
+                        d2 = tx - ox;
+                      else
+                        d2 = ox - tx;
+                      if (ty > oy)
+                        d2 += ty - oy;
+                      else
+                        d2 += oy - ty;
+                      d2 /= 6;
+                      if (d2 > 1) d2 = 1;
+
+                      float fix =
+                          (tx - gdata->data.view_xx) * gdata->data.gsc + mww2;
+                      float fiy =
+                          (ty - gdata->data.view_yy) * gdata->data.gsc + mhh2;
+
+                      float alpha = strength * d2 * a * om *
+                                    (.5 + .5 * cosf(j / 4 - o->sfr));
+                      int cg_id = o->cusk_data[(int)j % o->cusk_len];
+                      vec3s studio_glow;
+                      vec3s* shc = studio_glow_for(env, o, (int)j, &studio_glow,
+                                                   gdata->cg_glow_colors + cg_id);
+
+                      bst_renderer_push(
+                          usr->r->bsta,
+                          &(bst_instance){{fix - glsz, fiy - glsz, 2 * glsz},
+                                          {shc->r, shc->g, shc->b, alpha}});
+                    }
+                } else {
+                  for (j = bp - 1; j >= 0; j--)
+                    if (gdata->data.pbu[(int)j] == 2 && ((int)j % WYRM_BOOST_STRIDE) == 0) {
+                      ox = tx;
+                      oy = ty;
+                      tx = gdata->data.pbx[(int)j];
+                      ty = gdata->data.pby[(int)j];
+                      if (tx > ox)
+                        d2 = tx - ox;
+                      else
+                        d2 = ox - tx;
+                      if (ty > oy)
+                        d2 += ty - oy;
+                      else
+                        d2 += oy - ty;
+                      d2 /= 6;
+                      if (d2 > 1) d2 = 1;
+
+                      float fix =
+                          (tx - gdata->data.view_xx) * gdata->data.gsc + mww2;
+                      float fiy =
+                          (ty - gdata->data.view_yy) * gdata->data.gsc + mhh2;
+
+                      float alpha = strength * d2 * a * om *
+                                    (.5 + .5 * cosf(j / 4 - o->sfr));
+
+                      int default_skin_len = gdata->default_skins[o->cv][0];
+                      int cg_id =
+                          gdata->default_skins[o->cv]
+                                              [1 + ((int)j % default_skin_len)];
+                      vec3s* shc = gdata->cg_glow_colors + cg_id;
+
+                      bst_renderer_push(
+                          usr->r->bsta,
+                          &(bst_instance){{fix - glsz, fiy - glsz, 2 * glsz},
+                                          {shc->r, shc->g, shc->b, alpha}});
+                    }
+                }
+              }
+            }
+          }
+
+          // draw eyes:
+          float ed = 6 * ssc;   // o->ed
+          float esp = 6 * ssc;  // o->esp
+          float er = 6;         // o->er
+          default_skin_data* dfs = gdata->dfs + ((1 - o->cusk) * (1 + o->cv));
+          float pr = dfs->pr;
+          float iris_r = er * ssc * gdata->data.gsc;
+          float pupil_r = pr * ssc * gdata->data.gsc;
+
+          float ex = cosf(fang) * ed + cosf(fang - PI / 2) * (esp + .5);
+          float ey = sinf(fang) * ed + sinf(fang - PI / 2) * (esp + .5);
+
+          float ea = mode->death_effect
+                         ? o->alive_amt * o->alive_amt * sqrtf(1 - o->dead_amt)
+                         : a;
+
+          /* Spine sits on the ImGui list, which is drawn after the sprites,
+             so eyes for a spine or a skinless strip are circles on that list
+             and end up on top (OM, 2026-10-05). */
+          {
+            int assist_on = usrs->hotkeys[HOTKEY_ASSIST].active ? 1 : 0;
+            /* Mine only, or everyone (OM, 2026-10-14). */
+            int spine_on = usrs->ext.spine[assist_on] &&
+                                   (!usrs->ext.spine_mine[assist_on] ||
+                                    o->id == gdata->data.snake_id)
+                               ? 1
+                               : 0;
+            int spine_mesh = 0;
+            if (spine_on)
+              spine_mesh = draw_snake_spine(env, o, bp, mww2, mhh2, a,
+                                            2.0f * lsz * gdata->data.gsc,
+                                            usrs->ext.spine_width[assist_on]);
+            /* A thin spine starts a point behind the head and leaves the
+               sprite eyes uncovered (OM, 2026-10-12). */
+            if (mode->render_mode == 3 || spine_mesh)
+              draw_snake_imgui_eyes(env, o, fang, hx, hy, ssc, ea, mww2, mhh2);
+            else if (studio_own(env, o))
+              studio_draw_eyes(env, o, fang, hx, hy, ssc, ea, mww2, mhh2);
+            else {
+          bp_renderer_push(
+              usr->r->bpr,
+              &(bp_instance){
+                  {(mww2 + (ex + hx - gdata->data.view_xx) * gdata->data.gsc) -
+                       iris_r,
+                   (mhh2 + (ey + hy - gdata->data.view_yy) * gdata->data.gsc) -
+                       iris_r,
+                   iris_r * 2, 0},
+                  gdata->cg_uvs[BLANK_UV],
+                  {dfs->ec.r, dfs->ec.g, dfs->ec.b, ea}});
+
+          ex = cosf(fang) * ed + cosf(fang + PI / 2) * (esp + .5);
+          ey = sinf(fang) * ed + sinf(fang + PI / 2) * (esp + .5);
+
+          bp_renderer_push(
+              usr->r->bpr,
+              &(bp_instance){
+                  {(mww2 + (ex + hx - gdata->data.view_xx) * gdata->data.gsc) -
+                       iris_r,
+                   (mhh2 + (ey + hy - gdata->data.view_yy) * gdata->data.gsc) -
+                       iris_r,
+                   iris_r * 2, 0},
+                  gdata->cg_uvs[BLANK_UV],
+                  {dfs->ec.r, dfs->ec.g, dfs->ec.b, ea}});
+
+          ex =
+              cosf(fang) * (ed + .5) + o->rex * ssc + cosf(fang - PI / 2) * esp;
+          ey =
+              sinf(fang) * (ed + .5) + o->rey * ssc + sinf(fang - PI / 2) * esp;
+
+          bp_renderer_push(
+              usr->r->bpr,
+              &(bp_instance){
+                  {(mww2 + (ex + hx - gdata->data.view_xx) * gdata->data.gsc) -
+                       pupil_r,
+                   (mhh2 + (ey + hy - gdata->data.view_yy) * gdata->data.gsc) -
+                       pupil_r,
+                   pupil_r * 2, 0},
+                  gdata->cg_uvs[BLANK_UV],
+                  {dfs->ppc.r, dfs->ppc.g, dfs->ppc.b, ea}});
+
+          ex =
+              cosf(fang) * (ed + .5) + o->rex * ssc + cosf(fang + PI / 2) * esp;
+          ey =
+              sinf(fang) * (ed + .5) + o->rey * ssc + sinf(fang + PI / 2) * esp;
+
+          bp_renderer_push(
+              usr->r->bpr,
+              &(bp_instance){
+                  {(mww2 + (ex + hx - gdata->data.view_xx) * gdata->data.gsc) -
+                       pupil_r,
+                   (mhh2 + (ey + hy - gdata->data.view_yy) * gdata->data.gsc) -
+                       pupil_r,
+                   pupil_r * 2, 0},
+                  gdata->cg_uvs[BLANK_UV],
+                  {dfs->ppc.r, dfs->ppc.g, dfs->ppc.b, ea}});
+
+            }
+          }
+
+          // The tag hangs off the head, over everything else the snake is
+          // wearing, which is where the mod puts it too.
+          const int hide_own_cosmetics =
+              usrs->hotkeys[HOTKEY_ASSIST].active &&
+              usrs->ext.assist_hide_cosmetics &&
+              o->id == gdata->data.snake_id;
+          if (!hide_own_cosmetics)
+          tags_draw(env, o, o->id == gdata->data.snake_id, false);
+
+          // accessory:
+          if (!hide_own_cosmetics && mode->show_accessories && o->accessory < NUM_ACCESSORIES) {
+            accessory_data* acc = gdata->accessories + o->accessory;
+            ex = acc->of * cosf(fang) * ed;
+            ey = acc->of * sinf(fang) * ed;
+            m = lsz * gdata->data.gsc * acc->sc;
+            float acx =
+                mww2 + (ex + hx - gdata->data.view_xx) * gdata->data.gsc;
+            float acy =
+                mhh2 + (ey + hy - gdata->data.view_yy) * gdata->data.gsc;
+
+            bp_renderer_push(
+                usr->r->bpr,
+                &(bp_instance){
+                    {acx - m, acy - m, m * 2, fang}, acc->uv, {1, 1, 1, ea}});
+          }
+#if defined(WYRM_SDL_JNI)
+          // Wyrm's own hair, ears and glasses: the player's snake only, and
+          // only on this phone (platform/android_look.c).
+          if (!hide_own_cosmetics && o->id == gdata->data.snake_id)
+            wyrm_look_draw(env, hx, hy, fang, lsz, ea, mww2, mhh2);
+#endif
+        } else {
+          // Tags are a separate cosmetic hanging from the head, not snake
+          // thickness, so Rope Mode leaves the player's chosen tag intact.
+          if (!(usrs->hotkeys[HOTKEY_ASSIST].active &&
+                usrs->ext.assist_hide_cosmetics))
+          tags_draw(env, o, true, false);
+        }
+
+        // ex = cosf(fang) * lsz;
+        // ey = sinf(fang) * lsz;
+        // float sz = 2 * gdata->data.gsc;
+
+        // bp_renderer_push(
+        //     usr->r->astr,
+        //     &(bp_instance){
+        //         {(mww2 + (ex + hx - gdata->data.view_xx) * gdata->data.gsc)
+        //         -
+        //              (sz + 2),
+        //          (mhh2 + (ey + hy - gdata->data.view_yy) * gdata->data.gsc)
+        //          -
+        //              (sz + 2),
+        //          (sz + 2) * 2, 0},
+        //         gdata->cg_uvs[BLANK_UV],
+        //         {0, 0, 0, a}});
+
+        // bp_renderer_push(
+        //     usr->r->astr,
+        //     &(bp_instance){
+        //         {(mww2 + (ex + hx - gdata->data.view_xx) * gdata->data.gsc)
+        //         -
+        //              sz,
+        //          (mhh2 + (ey + hy - gdata->data.view_yy) * gdata->data.gsc)
+        //          -
+        //              sz,
+        //          sz * 2, 0},
+        //         gdata->cg_uvs[BLANK_UV],
+        //         {1, 1, 1, a}});
+      }
+    }
+  }
+
+#if defined(__ANDROID__) || defined(WYRM_MOBILE)
+  ImDrawList_PopTexture(name_draw_list);
+#endif
+  igPopFont();
+
+  usr->r->global.view[0] = gdata->data.view_xx;
+  usr->r->global.view[1] = gdata->data.view_yy;
+  usr->r->global.zoom = gdata->data.gsc;
+  usr->r->global.grd = gdata->data.grd;
+  usr->r->global.bd_radius = gdata->data.flux_grd;
+  usr->r->global.bd_color[0] = usrs->bd_color[0];
+  usr->r->global.bd_color[1] = usrs->bd_color[1];
+  usr->r->global.bd_color[2] = usrs->bd_color[2];
+  usr->r->global.bg_scale = mode->bg_scale;
+  /* "None" is the absence of a floor, so it is drawn as one: the pass still
+     runs, with nothing of it reaching the frame, and the clear shows through
+     as flat black. */
+  const int floor_index = background_clamp(usrs->arena_background);
+  usr->r->global.bg_opacity = floor_index == BACKGROUND_NONE ? 0.0f : 1.0f;
+  usr->r->global.bd_opacity = 0.8f;
+  usr->r->global.minimap_data_size = gdata->data.mmsz;
+
+#if defined(__ANDROID__)
+  /* This is the front edge of the local head, not the touch cursor.  The
+     14.5 radius is the same half-size used to draw the head bead above, and
+     ehang is the same smoothed angle used by the rendered head, so the marker
+     turns at exactly the visible head's speed rather than jumping to input.
+     Keeping this in the draw path makes it a guide only: steering, collision
+     and every byte sent to the arena remain untouched. */
+  if (mode->show_crosshair &&
+      mobile_controls_steering_mode(env) != MOBILE_STEERING_ARROW) {
+    snake* own = get_snake(gdata, gdata->data.snake_id);
+    if (own && own->iiv && !own->dead) {
+      const float head_radius = 14.5f * own->sc;
+      const float collision_x =
+          own->xx + own->fx + cosf(own->ehang) * head_radius;
+      const float collision_y =
+          own->yy + own->fy + sinf(own->ehang) * head_radius;
+      const ImVec2 point = {
+          mww2 + (collision_x - gdata->data.view_xx) * gdata->data.gsc,
+          mhh2 + (collision_y - gdata->data.view_yy) * gdata->data.gsc};
+      const int dot_mode = usrs->hotkeys[HOTKEY_ASSIST].active ? 1 : 0;
+      /* The setting is a world-space diameter, like the 29-unit head bead.
+         Project both through the snake scale and camera zoom so their ratio
+         cannot change with viewport size, resolution or zoom. */
+      const float radius = usrs->head_dot_size[dot_mode] * own->sc *
+                           gdata->data.gsc * 0.5f;
+      const float* color = usrs->head_dot_color[dot_mode];
+      ImDrawList_AddCircleFilled(
+          igGetWindowDrawList(), point, radius,
+          igColorConvertFloat4ToU32(
+              (ImVec4){color[0], color[1], color[2], own->alive_amt}),
+          20);
+    }
+  }
+#endif
+
+  /* Black is drawn the way assist mode's hidden floor is: no colour, full
+     opacity, so it is true black in either mode. */
+  usr->r->global.bg_color[0] = usr->r->global.bg_color[1] =
+      usr->r->global.bg_color[2] =
+          floor_index == BACKGROUND_BLACK ? 0.0f : (float)mode->show_background;
+  /* The solid pipeline now owns every analytic shape, including rings. Preys
+   * remain original circles in fd_renderer_render(). */
+  usr->r->fdr->pipeline_idx = 0;
+
+  /* About half a second to cross-fade a minimap cell (was ~0.3 s), so a
+     snake's mark glides to its new cells (OM, 2026-10-09). */
+  lerp_minimap_float(gdata->data.mm_data_follow, gdata->data.mm_data,
+                     gdata->data.mmsz, 0.035f * gdata->data.vfr);
+
+  minimap_float_to_u8(gdata->data.mm_data_follow, usr->r->mmr->minimap,
+                      gdata->data.mmsz);
+
+  gdata->data.frames++;
+
+  if (gdata->data.fps_etm >= 1000) {
+    gdata->data.fps = gdata->data.frames;
+    gdata->data.frames = 0;
+    gdata->data.fps_ltm = gdata->data.ctm;
+  }
+
+  // ping: measured per pong in oef.c (ping_mark_received, OM 2026-10-12);
+  // this only eases the colour towards it.
+  gdata->data.ping_follow = glm_lerp(
+      gdata->data.ping_follow,
+      GLM_MAX(GOOD_PING, GLM_MIN((float)gdata->data.ping, BAD_PING)),
+      0.1f * gdata->data.vfr);
+}

@@ -1,0 +1,554 @@
+#include "mobile_hotkeys.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "../game/arena_theme.h"
+#include "../user.h"
+#include "../platform/rain_bridge.h"
+
+#ifdef WYRM_SDL_JNI
+#include <SDL3/SDL.h>
+#endif
+
+static const char* ACTION_NAMES[NUM_MOBILE_ACTIONS] = {
+    "HUD",         "Show names", "Big food",   "Assist",     "Bot",
+    "Hotkey menu", "Restart",    "Quit",       "Zoom in",    "Zoom out",
+    "Boost",       "Turn left",  "Turn right", "Fullscreen", "Auto restart",
+    "Eyes back",   "Rain"};
+
+bool mobile_hotkey_is_on_screen_button(int action) {
+  return action == HOTKEY_SHOW_NAMES || action == HOTKEY_BIG_FOOD ||
+         action == HOTKEY_ASSIST || action == HOTKEY_BOT ||
+         action == HOTKEY_RESTART || action == HOTKEY_QUIT ||
+         action == MOBILE_HOTKEY_ZOOM_IN ||
+         action == MOBILE_HOTKEY_ZOOM_OUT ||
+         /* Auto restart (OM, 2026-10-05) lives in the rope-mode slot. */
+         action == MOBILE_HOTKEY_ROPE_MODE ||
+         /* Eyes Back (OM, 2026-10-06). */
+         action == MOBILE_HOTKEY_EYES_BACK ||
+         /* Snakey Rain (OM, 2026-10-14): opens the Rain panel. */
+         action == MOBILE_HOTKEY_RAIN;
+}
+
+static float clampf_local(float value, float lo, float hi) {
+  return value < lo ? lo : (value > hi ? hi : value);
+}
+
+static float button_scale(tenv* env) {
+  /* The short side: the height sideways, the width upright (portrait play). */
+  int short_side = env->wnd->size[0] < env->wnd->size[1] ? env->wnd->size[0]
+                                                         : env->wnd->size[1];
+  return clampf_local(short_side / 720.0f, 0.82f, 1.45f);
+}
+
+static void action_geometry(tenv* env, int action, float* cx, float* cy,
+                            float* width, float* height) {
+  float x = 0.5f;
+  float y = 0.22f;
+  mobile_hotkey_get_layout(&env->usr->usrs, action, NULL, &x, &y);
+  *cx = clampf_local(x, 0.0f, 1.0f) * env->wnd->size[0];
+  *cy = clampf_local(y, 0.0f, 1.0f) * env->wnd->size[1];
+  float* key_scale = user_settings_key_scale(&env->usr->usrs, action);
+  float scale = button_scale(env) *
+                clampf_local(key_scale ? *key_scale : 1.0f, 0.65f, 5.00f);
+  *width = 104.0f * scale;
+  *height = 54.0f * scale;
+}
+
+static bool hit_action(tenv* env, int action, float x, float y) {
+  float cx, cy, width, height;
+  action_geometry(env, action, &cx, &cy, &width, &height);
+  return fabsf(x - cx) <= width * 0.5f && fabsf(y - cy) <= height * 0.5f;
+}
+
+void mobile_hotkeys_init(tenv* env) {
+  memset(&env->usr->mobile_hotkeys, 0, sizeof(env->usr->mobile_hotkeys));
+  env->usr->mobile_hotkeys.editor_focus = -1;
+}
+
+void mobile_hotkeys_reset_runtime(tenv* env) {
+  mobile_hotkeys_state* state = &env->usr->mobile_hotkeys;
+  memset(state->down, 0, sizeof(state->down));
+  memset(state->pressed, 0, sizeof(state->pressed));
+  memset(state->finger, 0, sizeof(state->finger));
+}
+
+bool mobile_hotkeys_down(tenv* env, int action) {
+  return action >= 0 && action < NUM_MOBILE_ACTIONS &&
+         env->usr->mobile_hotkeys.down[action];
+}
+
+bool mobile_hotkeys_pressed(tenv* env, int action) {
+  if (action < 0 || action >= NUM_MOBILE_ACTIONS) return false;
+  bool pressed = env->usr->mobile_hotkeys.pressed[action];
+  env->usr->mobile_hotkeys.pressed[action] = false;
+  return pressed;
+}
+
+#ifdef WYRM_SDL_JNI
+bool mobile_hotkeys_process_event(tenv* env, const void* raw_event) {
+  const SDL_Event* event = raw_event;
+  if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND ||
+      event->type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+    mobile_hotkeys_reset_runtime(env);
+    return false;
+  }
+  if (event->type != SDL_EVENT_FINGER_DOWN &&
+      event->type != SDL_EVENT_FINGER_MOTION &&
+      event->type != SDL_EVENT_FINGER_UP &&
+      event->type != SDL_EVENT_FINGER_CANCELED)
+    return false;
+  if (env->usr->gdata.curr_screen != PLAYING ||
+      (env->usr->gdata.conn != CONNECTED &&
+       env->usr->gdata.conn != AI_CONNECTED))
+    return false;
+
+  mobile_hotkeys_state* state = &env->usr->mobile_hotkeys;
+  uint64_t finger = (uint64_t)event->tfinger.fingerID;
+  float x = event->tfinger.x * env->wnd->size[0];
+  float y = event->tfinger.y * env->wnd->size[1];
+
+  if (event->type == SDL_EVENT_FINGER_DOWN) {
+    for (int action = 0; action < NUM_MOBILE_ACTIONS; ++action) {
+      if (!mobile_hotkey_is_on_screen_button(action)) continue;
+      bool visible = false;
+      mobile_hotkey_get_layout(&env->usr->usrs, action, &visible, NULL, NULL);
+      if (!visible || state->down[action] || !hit_action(env, action, x, y))
+        continue;
+      state->finger[action] = finger;
+      state->down[action] = true;
+      state->pressed[action] = true;
+      return true;
+    }
+    return false;
+  }
+
+  for (int action = 0; action < NUM_MOBILE_ACTIONS; ++action) {
+    if (!state->down[action] || state->finger[action] != finger) continue;
+    if (event->type == SDL_EVENT_FINGER_UP ||
+        event->type == SDL_EVENT_FINGER_CANCELED)
+      state->down[action] = false;
+    return true;
+  }
+  return false;
+}
+#else
+bool mobile_hotkeys_process_event(tenv* env, const void* event) {
+  (void)env;
+  (void)event;
+  return false;
+}
+#endif
+
+static ImU32 color(float r, float g, float b, float a) {
+  return igColorConvertFloat4ToU32((ImVec4){r, g, b, a});
+}
+
+/* A key's colour (OM, 2026-10-14): the team roster's nine, 0 = theme.
+   Returns false for the theme; else the RGB in r, g, b (0..1). */
+static bool key_palette(int index, float* r, float* g, float* b);
+static bool key_colour(tenv* env, int action, float* r, float* g, float* b) {
+  if (action < 0 || action >= 20) return false;
+  return key_palette(env->usr->usrs.ext.key_colour[action], r, g, b);
+}
+/* A key's fill (OM, 2026-10-14), the same nine colours. */
+static bool key_fill(tenv* env, int action, float* r, float* g, float* b) {
+  if (action < 0 || action >= 20) return false;
+  if (env->usr->usrs.ext.key_fill[action] == 9) {
+    *r = *g = *b = 128.0f / 255.0f;
+    return true;
+  }
+  return key_palette(env->usr->usrs.ext.key_fill[action], r, g, b);
+}
+static bool key_palette(int index, float* r, float* g, float* b) {
+  static const uint32_t palette[] = {0x000000, 0xFFFFFF, 0x111111,
+                                     0xFFD54A, 0x4DD9FF, 0x5BE37D,
+                                     0xFF6FB5, 0xFF9A3C, 0xFF5A5A};
+  if (index <= 0 || index > 8) return false;
+  uint32_t c = palette[index];
+  *r = ((c >> 16) & 255) / 255.0f;
+  *g = ((c >> 8) & 255) / 255.0f;
+  *b = (c & 255) / 255.0f;
+  return true;
+}
+
+static bool action_active(tenv* env, int action) {
+  if (action >= 0 && action < NUM_HOTKEYS)
+    return env->usr->usrs.hotkeys[action].active;
+  /* The rope-mode slot is the Auto restart toggle now: lit while it is on. */
+  if (action == MOBILE_HOTKEY_ROPE_MODE)
+    return WYRM_EXPERIMENTAL_ROPE_MODE ? env->usr->mobile_hotkeys.rope_mode
+                                       : env->usr->usrs.auto_respawn != 0;
+  /* Eyes Back: lit while it is on (the key is a toggle). */
+  if (action == MOBILE_HOTKEY_EYES_BACK) {
+    extern bool eyes_back_active(void);
+    return eyes_back_active();
+  }
+  if (action >= NUM_HOTKEYS && action < NUM_MOBILE_ACTIONS)
+    return mobile_hotkeys_down(env, action) ||
+           twindow_key_down(env->wnd,
+                            mobile_hotkey_get_key(&env->usr->usrs, action));
+  return false;
+}
+
+void mobile_hotkeys_draw_gameplay(tenv* env) {
+#ifdef WYRM_SDL_JNI
+  if (env->usr->gdata.curr_screen != PLAYING ||
+      (env->usr->gdata.conn != CONNECTED &&
+       env->usr->gdata.conn != AI_CONNECTED))
+    return;
+  mobile_hotkeys_state* state = &env->usr->mobile_hotkeys;
+  ImDrawList* draw = igGetForegroundDrawList_ViewportPtr(igGetMainViewport());
+  for (int action = 0; action < NUM_MOBILE_ACTIONS; ++action) {
+    if (!mobile_hotkey_is_on_screen_button(action)) continue;
+    bool visible = false;
+    mobile_hotkey_get_layout(&env->usr->usrs, action, &visible, NULL, NULL);
+    if (!visible) continue;
+    float cx, cy, width, height;
+    action_geometry(env, action, &cx, &cy, &width, &height);
+    bool active = action_active(env, action);
+    bool pressed = state->down[action];
+    float* key_opacity = user_settings_key_opacity(&env->usr->usrs, action);
+    float alpha =
+        clampf_local(key_opacity ? *key_opacity : 1.0f, 0.05f, 1.0f);
+    ImVec2 min = {cx - width * 0.5f, cy - height * 0.5f};
+    ImVec2 max = {cx + width * 0.5f, cy + height * 0.5f};
+    float corner = height * 0.30f;
+    /* Wyrm's ink halo (OM, 2026-10-02): the key's edge holds on a white floor
+       too; a pressed or lit key also gets a green ring. */
+    for (int i = 0; i < 4; ++i) {
+      float grow = 2.0f + i * 2.5f;
+      ImDrawList_AddRect(draw, (ImVec2){min.x - grow, min.y - grow},
+                         (ImVec2){max.x + grow, max.y + grow},
+                         color(0.035f, 0.040f, 0.055f, alpha * (0.16f - i * 0.035f)),
+                         corner + grow, 0, 2.5f);
+    }
+    /* A key that is on only turns its border green (OM, 2026-10-14). */
+    /* Paper paint inside the exact same rectangle used by hit_action(). Input,
+       mode and placement are deliberately not part of this draw function. */
+    ImDrawList_AddRectFilled(draw, (ImVec2){min.x, min.y + height * 0.07f},
+                             (ImVec2){max.x, max.y + height * 0.07f},
+                             color(0, 0, 0, alpha * 0.16f), corner, 0);
+    /* Two colours (OM, 2026-10-14): the fill, and the label + border. */
+    float kr = 0, kg = 0, kb = 0, fr = 0, fg = 0, fb = 0;
+    bool coloured = key_colour(env, action, &kr, &kg, &kb);
+    bool filled = key_fill(env, action, &fr, &fg, &fb);
+    ImDrawList_AddRectFilled(
+        draw, min, max,
+        filled ? color(fr, fg, fb, alpha * 0.94f)
+               : arena_theme_colour(ARENA_THEME_CARD, alpha * 0.94f),
+        corner, 0);
+    bool on = active || pressed;
+    ImDrawList_AddRect(draw, min, max,
+                       on ? color(0.247f, 0.933f, 0.588f, 1.0f)
+                       : coloured ? color(kr, kg, kb, 0.9f)
+                       : color(1.0f, 1.0f, 1.0f, 0.9f),
+                       corner, 0, on ? 3.0f : 1.5f);
+    const char* function = mobile_hotkey_action_name(action);
+    /* Dark type on a lit key, light type on a dim one. */
+    /* Opacity belongs to the surface only. Keeping type and outline at full
+       theme contrast means a nearly transparent key is still identifiable. */
+    ImU32 primary = color(1.0f, 1.0f, 1.0f, 1.0f);
+    /* The label takes the key's colour (OM, 2026-10-14). */
+    if (coloured) primary = color(kr, kg, kb, 1.0f);
+    ImFont* font = env->usr->imgui_data.body_font[FONT_SIZE_REGULAR];
+    igPushFont(font, font->LegacySize);
+    ImVec2 size;
+    igCalcTextSize(&size, function, NULL, false, -1);
+    igPopFont();
+    /* A longer name ("Auto restart") is set smaller to stay inside the key. */
+    float text_size = font->LegacySize;
+    float room = width - 16.0f;
+    if (size.x > room && size.x > 0.0f) {
+      text_size *= room / size.x;
+      size.x = room;
+      size.y *= text_size / font->LegacySize;
+    }
+    ImDrawList_AddText_FontPtr(
+        draw, font, text_size,
+        (ImVec2){cx - size.x * 0.5f, cy - size.y * 0.5f}, primary, function,
+        NULL, 0, NULL);
+  }
+#else
+  (void)env;
+#endif
+}
+
+void mobile_hotkeys_begin_editor(tenv* env, int focus_action) {
+  mobile_hotkeys_state* state = &env->usr->mobile_hotkeys;
+  state->edit_backup = env->usr->usrs.mobile_hotkeys;
+  state->rope_mode_key_backup = env->usr->usrs.rope_mode_key;
+  state->rope_mode_visible_backup = env->usr->usrs.rope_mode_visible;
+  state->rope_mode_x_backup = env->usr->usrs.rope_mode_x;
+  state->rope_mode_y_backup = env->usr->usrs.rope_mode_y;
+  state->eyes_back_visible_backup = env->usr->usrs.ext.eyes_back_visible;
+  state->eyes_back_x_backup = env->usr->usrs.ext.eyes_back_x;
+  state->eyes_back_y_backup = env->usr->usrs.ext.eyes_back_y;
+  state->rain_x_backup = env->usr->usrs.ext.rain_x;
+  state->rain_y_backup = env->usr->usrs.ext.rain_y;
+  state->editor_focus = focus_action >= 0 && focus_action < NUM_MOBILE_ACTIONS
+                            ? focus_action
+                            : -1;
+  state->editor_active = true;
+  mobile_hotkeys_reset_runtime(env);
+}
+
+void mobile_hotkeys_finish_editor(tenv* env, bool save) {
+  mobile_hotkeys_state* state = &env->usr->mobile_hotkeys;
+  if (!save) {
+    env->usr->usrs.mobile_hotkeys = state->edit_backup;
+    env->usr->usrs.rope_mode_key = state->rope_mode_key_backup;
+    env->usr->usrs.rope_mode_visible = state->rope_mode_visible_backup;
+    env->usr->usrs.rope_mode_x = state->rope_mode_x_backup;
+    env->usr->usrs.rope_mode_y = state->rope_mode_y_backup;
+    env->usr->usrs.ext.eyes_back_visible = state->eyes_back_visible_backup;
+    env->usr->usrs.ext.eyes_back_x = state->eyes_back_x_backup;
+    env->usr->usrs.ext.eyes_back_y = state->eyes_back_y_backup;
+    env->usr->usrs.ext.rain_x = state->rain_x_backup;
+    env->usr->usrs.ext.rain_y = state->rain_y_backup;
+  }
+  state->editor_active = false;
+  state->editor_focus = -1;
+  if (save) save_user_settings(&env->usr->usrs);
+}
+
+void mobile_hotkeys_reset_layout(tenv* env) {
+  mobile_hotkey_settings* cfg = &env->usr->usrs.mobile_hotkeys;
+  for (int i = 0; i < NUM_MOBILE_HOTKEYS; ++i) {
+    bool right = i >= (NUM_MOBILE_HOTKEYS + 1) / 2;
+    int row = right ? i - (NUM_MOBILE_HOTKEYS + 1) / 2 : i;
+    cfg->x[i] = right ? 0.91f : 0.09f;
+    cfg->y[i] = 0.18f + row * 0.105f;
+  }
+  env->usr->usrs.rope_mode_x = 0.50f;
+  env->usr->usrs.rope_mode_y = 0.22f;
+  env->usr->usrs.ext.eyes_back_x = 0.50f;
+  env->usr->usrs.ext.eyes_back_y = 0.33f;
+  env->usr->usrs.ext.rain_x = 0.50f;
+  env->usr->usrs.ext.rain_y = 0.12f;
+}
+
+void mobile_hotkeys_set_position(tenv* env, int action, float x, float y) {
+  if (action < 0 || action >= NUM_MOBILE_ACTIONS) return;
+  bool visible = false;
+  mobile_hotkey_get_layout(&env->usr->usrs, action, &visible, NULL, NULL);
+  mobile_hotkey_set_layout(&env->usr->usrs, action, visible,
+                           clampf_local(x / env->wnd->size[0], 0.0f, 1.0f),
+                           clampf_local(y / env->wnd->size[1], 0.0f, 1.0f));
+}
+
+void mobile_hotkeys_get_position(tenv* env, int action, float* x, float* y) {
+  float width, height;
+  action_geometry(env, action, x, y, &width, &height);
+}
+
+const char* mobile_hotkey_action_name(int action) {
+  return action >= 0 && action < NUM_MOBILE_ACTIONS ? ACTION_NAMES[action]
+                                                    : "Unknown";
+}
+
+int mobile_hotkey_get_key(const user_settings* settings, int action) {
+  if (action >= 0 && action < NUM_HOTKEYS) return settings->hotkeys[action].key;
+  if (action == MOBILE_HOTKEY_ROPE_MODE) return settings->rope_mode_key;
+  int direct = action - NUM_HOTKEYS;
+  if (direct >= 0 && direct < NUM_MOBILE_DIRECT_HOTKEYS)
+    return settings->mobile_hotkeys.direct_keys[direct];
+#ifdef WYRM_DESKTOP
+  if (action == MOBILE_HOTKEY_EYES_BACK) return settings->ext.eyes_back_key;
+#endif
+  return GLFW_KEY_UNKNOWN;
+}
+
+void mobile_hotkey_set_key(user_settings* settings, int action, int key) {
+  if (action >= 0 && action < NUM_HOTKEYS)
+    settings->hotkeys[action].key = key;
+  else if (action == MOBILE_HOTKEY_ROPE_MODE)
+    settings->rope_mode_key = key;
+  else {
+    int direct = action - NUM_HOTKEYS;
+    if (direct >= 0 && direct < NUM_MOBILE_DIRECT_HOTKEYS)
+      settings->mobile_hotkeys.direct_keys[direct] = key;
+#ifdef WYRM_DESKTOP
+    else if (action == MOBILE_HOTKEY_EYES_BACK)
+      settings->ext.eyes_back_key = key;
+#endif
+  }
+}
+
+const char* mobile_hotkey_key_name(const user_settings* settings, int action) {
+  static char labels[4][12];
+  static int slot;
+  int key = mobile_hotkey_get_key(settings, action);
+  switch (key) {
+    case GLFW_KEY_SPACE:
+      return "SPACE";
+    case GLFW_KEY_LEFT:
+      return "LEFT";
+    case GLFW_KEY_RIGHT:
+      return "RIGHT";
+    case GLFW_KEY_UP:
+      return "UP";
+    case GLFW_KEY_DOWN:
+      return "DOWN";
+    case GLFW_KEY_F11:
+      return "F11";
+#ifdef WYRM_DESKTOP
+    case GLFW_KEY_TAB:
+      return "TAB";
+    case GLFW_KEY_LEFT_SHIFT:
+      return "SHIFT";
+    case GLFW_KEY_LEFT_CONTROL:
+      return "CTRL";
+    case WYRM_KEY_MOUSE_RIGHT:
+      return "RIGHT CLICK";
+    case WYRM_KEY_MOUSE_MIDDLE:
+      return "MIDDLE CLICK";
+    case WYRM_KEY_MOUSE_BACK:
+      return "MOUSE 4";
+    case WYRM_KEY_MOUSE_FORWARD:
+      return "MOUSE 5";
+    case GLFW_KEY_UNKNOWN:
+      return "NONE";
+#endif
+    default:
+      slot = (slot + 1) % 4;
+#ifdef WYRM_DESKTOP
+      if ((key >= GLFW_KEY_F1 && key <= GLFW_KEY_F10) || key == GLFW_KEY_F12) {
+        snprintf(labels[slot], sizeof(labels[slot]), "F%d",
+                 key - GLFW_KEY_F1 + 1);
+        return labels[slot];
+      }
+#endif
+      if ((key >= GLFW_KEY_0 && key <= GLFW_KEY_9) ||
+          (key >= GLFW_KEY_A && key <= GLFW_KEY_Z)) {
+        snprintf(labels[slot], sizeof(labels[slot]), "%c", (char)key);
+        return labels[slot];
+      }
+      return "KEY";
+  }
+}
+
+bool mobile_hotkey_is_hold_action(const user_settings* settings, int action) {
+  if (action >= 0 && action < NUM_HOTKEYS)
+    return action != HOTKEY_RESTART && action != HOTKEY_QUIT &&
+           settings->hotkeys[action].mode != 0;
+  return action == MOBILE_HOTKEY_BOOST || action == MOBILE_HOTKEY_TURN_LEFT ||
+         action == MOBILE_HOTKEY_TURN_RIGHT;
+}
+
+void mobile_hotkey_get_layout(const user_settings* settings, int action,
+                              bool* visible, float* x, float* y) {
+  if (action >= 0 && action < NUM_MOBILE_HOTKEYS) {
+    if (visible) *visible = settings->mobile_hotkeys.visible[action];
+    if (x) *x = settings->mobile_hotkeys.x[action];
+    if (y) *y = settings->mobile_hotkeys.y[action];
+  } else if (action == MOBILE_HOTKEY_ROPE_MODE) {
+    if (visible) *visible = settings->rope_mode_visible;
+    if (x) *x = settings->rope_mode_x;
+    if (y) *y = settings->rope_mode_y;
+  } else if (action == MOBILE_HOTKEY_EYES_BACK) {
+    if (visible) *visible = settings->ext.eyes_back_visible;
+    if (x) *x = settings->ext.eyes_back_x;
+    if (y) *y = settings->ext.eyes_back_y;
+  } else if (action == MOBILE_HOTKEY_RAIN) {
+    /* Shown exactly while Snakey Rain is on. */
+    if (visible) *visible = wyrm_rain_enabled();
+    if (x) *x = settings->ext.rain_x;
+    if (y) *y = settings->ext.rain_y;
+  }
+}
+
+void mobile_hotkey_set_layout(user_settings* settings, int action, bool visible,
+                              float x, float y) {
+  x = clampf_local(x, 0.0f, 1.0f);
+  y = clampf_local(y, 0.0f, 1.0f);
+  if (action >= 0 && action < NUM_MOBILE_HOTKEYS) {
+    settings->mobile_hotkeys.visible[action] = visible;
+    settings->mobile_hotkeys.x[action] = x;
+    settings->mobile_hotkeys.y[action] = y;
+  } else if (action == MOBILE_HOTKEY_ROPE_MODE) {
+    settings->rope_mode_visible = visible;
+    settings->rope_mode_x = x;
+    settings->rope_mode_y = y;
+  } else if (action == MOBILE_HOTKEY_EYES_BACK) {
+    settings->ext.eyes_back_visible = visible;
+    settings->ext.eyes_back_x = x;
+    settings->ext.eyes_back_y = y;
+  } else if (action == MOBILE_HOTKEY_RAIN) {
+    settings->ext.rain_x = x;
+    settings->ext.rain_y = y;
+  }
+}
+
+#ifdef WYRM_DESKTOP
+/* Wyrm Desktop (OM, 2026-10-11): every action is a key on a computer. These
+   are the keys it can take: the phone list plus the desktop's own (Tab,
+   Shift, Ctrl, F1-F12 but F11, the mouse's other buttons). F11 stays the
+   window's full screen key; Esc and Enter belong to the shell. */
+bool mobile_hotkey_key_bindable(int key) {
+  if ((key >= GLFW_KEY_0 && key <= GLFW_KEY_9) ||
+      (key >= GLFW_KEY_A && key <= GLFW_KEY_Z) ||
+      (key >= GLFW_KEY_F1 && key <= GLFW_KEY_F10) ||
+      (key >= WYRM_KEY_MOUSE_RIGHT && key <= WYRM_KEY_MOUSE_FORWARD))
+    return true;
+  switch (key) {
+    case GLFW_KEY_SPACE:
+    case GLFW_KEY_LEFT:
+    case GLFW_KEY_RIGHT:
+    case GLFW_KEY_UP:
+    case GLFW_KEY_DOWN:
+    case GLFW_KEY_F11:
+    case GLFW_KEY_F12:
+    case GLFW_KEY_TAB:
+    case GLFW_KEY_LEFT_SHIFT:
+    case GLFW_KEY_LEFT_CONTROL:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/* Whether some action already uses this key. */
+static bool desktop_key_taken(const user_settings* settings, int key) {
+  for (int action = 0; action < NUM_MOBILE_ACTIONS; ++action)
+    if (mobile_hotkey_get_key(settings, action) == key) return true;
+  return false;
+}
+
+/* Boost from the keyboard: the Boost key, and W and Up as well while no
+   other action has taken them. The left mouse button is mobile_controls'. */
+bool mobile_hotkeys_desktop_boost_down(tenv* env) {
+  const user_settings* settings = &env->usr->usrs;
+  if (twindow_key_down(env->wnd,
+                       mobile_hotkey_get_key(settings, MOBILE_HOTKEY_BOOST)))
+    return true;
+  if (!desktop_key_taken(settings, GLFW_KEY_W) &&
+      twindow_key_down(env->wnd, GLFW_KEY_W))
+    return true;
+  return !desktop_key_taken(settings, GLFW_KEY_UP) &&
+         twindow_key_down(env->wnd, GLFW_KEY_UP);
+}
+#endif
+
+#ifdef WYRM_DESKTOP
+/* A log line whenever a hotkey or boost changes, so a desktop run shows that
+   keys reached the game (OM, 2026-10-11: "no key works"). Human rate only. */
+void mobile_hotkeys_desktop_trace(tenv* env, bool boost) {
+  static bool known;
+  static bool last_active[NUM_HOTKEYS];
+  static bool last_boost;
+  const user_settings* settings = &env->usr->usrs;
+  for (int i = 0; i < NUM_HOTKEYS; ++i) {
+    bool active = settings->hotkeys[i].active;
+    if (known && active != last_active[i])
+      SDL_Log("Wyrm keys: %s %s", ACTION_NAMES[i], active ? "on" : "off");
+    last_active[i] = active;
+  }
+  if (known && boost != last_boost)
+    SDL_Log("Wyrm keys: boost %s", boost ? "on" : "off");
+  last_boost = boost;
+  known = true;
+}
+#endif

@@ -1,0 +1,1193 @@
+#include "android_home.h"
+
+#include <math.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+#ifdef WYRM_SDL_JNI
+#include <jni.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_system.h>
+
+#include "../network/server.h"
+#include "../network/arena_persona.h"
+#include "../network/arena_protocol.h"
+#include "../network/arena_trace.h"
+#include "../game/ai_mode.h"
+#include "../game/ui_overlay.h"
+#include "../ui/lobby.h"
+#include "../user.h"
+#include "android_team.h"
+#include "../mobile/mobile_controls.h"
+
+static tenv* home_env = NULL;
+static SDL_Mutex* home_mutex = NULL;
+
+/*
+ * The mailbox. Compose writes it from the Android main thread, the engine
+ * drains it once a frame, and it only ever holds the most recent request of
+ * each kind — a second tap on Play before the first is applied is the same
+ * intent, not a queue of matches.
+ */
+static bool pending_enter = false;
+static bool pending_ai_enter = false;
+static bool pending_ai_editor_enter = false;
+static bool pending_ai_editor_exit = false;
+static bool pending_editor_leaderboard_toggle = false;
+static char pending_nickname[MAX_NICKNAME_LEN + 1] = {0};
+static bool pending_nickname_save = false;
+static char pending_saved_nickname[MAX_NICKNAME_LEN + 1] = {0};
+static char pending_enter_arena[MAX_ARENA_LEN + 1] = {0};
+static uint64_t pending_enter_id = 0;
+static uint64_t last_enter_id = 0;
+static int pending_screen = -1;
+static bool pending_death_play = false;
+static bool pending_death_home = false;
+/* -1 nothing asked, 0 off, 1 on. Written by Compose from the card. */
+static int pending_auto_respawn = -1;
+static char pending_arena[MAX_ARENA_LEN + 1] = {0};
+
+/* Source death wait, then frame-scaled login fade. No automatic respawn. */
+static bool death_active = false;
+static bool death_watching = false;
+static Uint64 death_began_at = 0;
+static float death_opacity = 1;
+static bool run_recorded = false;
+/* Auto restart (OM, 2026-10-05): this death's restart is closing the socket. */
+static bool auto_restart_closing = false;
+
+/* Arena drops: what the current socket said on its way out, and whether this
+   life has already been reported. Engine thread only. */
+static int drop_close_code = 0;
+static char drop_close_reason[124] = {0};
+static char drop_error_text[160] = {0};
+static bool drop_errored = false;
+static bool drop_reported = false;
+/* Per socket: what the join carried, and whether a pre-spawn report went. */
+static bool prespawn_reported = false;
+static bool drop_timed_out = false;
+static bool join_was_sent = false;
+static int join_packet_bytes = 0;
+static int join_skin_bytes = 0;
+static int join_skin_runs = 0;
+static int join_nick_bytes = 0;
+static bool join_custom_skin = false;
+
+static bool get_activity(JNIEnv** out_env, jclass* out_class) {
+  *out_env = (JNIEnv*)SDL_GetAndroidJNIEnv();
+  if (!*out_env) {
+    SDL_Log("Wyrm home: JNI environment unavailable");
+    return false;
+  }
+  JNIEnv* env = *out_env;
+  *out_class = (*env)->FindClass(env, "com/wyrm/omrajput/WyrmActivity");
+  if (!*out_class) {
+    (*env)->ExceptionClear(env);
+    SDL_Log("Wyrm home: activity class unavailable");
+    return false;
+  }
+  return true;
+}
+
+static void clear_exception(JNIEnv* env) {
+  if ((*env)->ExceptionCheck(env)) {
+    (*env)->ExceptionDescribe(env);
+    (*env)->ExceptionClear(env);
+  }
+}
+
+void android_home_begin_life(void) {
+  run_recorded = false;
+  drop_reported = false;
+}
+
+void android_home_reset_death(void) {
+  death_opacity = 1;
+  death_watching = false;
+  death_active = false;
+  run_recorded = false;
+}
+
+void wyrm_last_death_set(float x, float y); /* game/ui_overlay.c */
+
+static void record_finished_run(tenv* env) {
+  user_settings* settings = &env->usr->usrs;
+  JNIEnv* jni = NULL;
+  jclass activity_class = NULL;
+  if (!get_activity(&jni, &activity_class)) return;
+  /* The third value is the life's length in seconds (play_time, set by
+     game_capture_final_score) for the lobby's "Share run" stats. */
+  jmethodID method = (*jni)->GetStaticMethodID(
+      jni, activity_class, "recordRunFromNative", "(IID)V");
+  if (method) {
+    double seconds = settings->play_time;
+    if (!isfinite(seconds) || seconds < 0) seconds = 0;
+    (*jni)->CallStaticVoidMethod(jni, activity_class, method,
+                                 (jint)settings->score,
+                                 (jint)settings->kills,
+                                 (jdouble)seconds);
+    clear_exception(jni);
+  } else {
+    (*jni)->ExceptionClear(jni);
+    SDL_Log("Wyrm home: recordRunFromNative unavailable");
+  }
+  /* Where this run ended: a red dot on the minimap during the next run
+     (ui_overlay.c, OM 2026-10-02). Real arenas only. */
+  if (!env->usr->gdata.ai_mode)
+    wyrm_last_death_set(env->usr->gdata.data.view_xx,
+                        env->usr->gdata.data.view_yy);
+  (*jni)->DeleteLocalRef(jni, activity_class);
+}
+
+void android_home_bind_env(tenv* env) {
+  home_env = env;
+  if (!home_mutex) home_mutex = SDL_CreateMutex();
+}
+
+void android_home_set_screen(int screen) {
+  JNIEnv* env = NULL;
+  jclass activity_class = NULL;
+  if (!get_activity(&env, &activity_class)) return;
+  jmethodID method = (*env)->GetStaticMethodID(env, activity_class,
+                                               "setScreenFromNative", "(I)V");
+  if (!method) {
+    (*env)->ExceptionClear(env);
+    SDL_Log("Wyrm home: setScreenFromNative unavailable");
+    (*env)->DeleteLocalRef(env, activity_class);
+    return;
+  }
+  (*env)->CallStaticVoidMethod(env, activity_class, method, (jint)screen);
+  clear_exception(env);
+  (*env)->DeleteLocalRef(env, activity_class);
+}
+
+void android_home_set_arena_port_available(bool available) {
+  JNIEnv* env = NULL;
+  jclass activity_class = NULL;
+  if (!get_activity(&env, &activity_class)) return;
+  jmethodID method = (*env)->GetStaticMethodID(
+      env, activity_class, "setArenaPortAvailableFromNative", "(Z)V");
+  if (method) {
+    (*env)->CallStaticVoidMethod(env, activity_class, method,
+                                 available ? JNI_TRUE : JNI_FALSE);
+    clear_exception(env);
+  } else {
+    (*env)->ExceptionClear(env);
+    SDL_Log("Wyrm home: setArenaPortAvailableFromNative unavailable");
+  }
+  (*env)->DeleteLocalRef(env, activity_class);
+}
+
+void android_home_arena_enter_ignored(void) {
+  JNIEnv* env = NULL;
+  jclass activity_class = NULL;
+  if (!get_activity(&env, &activity_class)) return;
+  jmethodID method = (*env)->GetStaticMethodID(
+      env, activity_class, "setArenaEnterIgnoredFromNative", "()V");
+  if (method) {
+    (*env)->CallStaticVoidMethod(env, activity_class, method);
+    clear_exception(env);
+  } else {
+    (*env)->ExceptionClear(env);
+  }
+  (*env)->DeleteLocalRef(env, activity_class);
+}
+
+void android_home_publish_state(tenv* env_ptr) {
+  if (!env_ptr) return;
+  user_settings* settings = &env_ptr->usr->usrs;
+
+  JNIEnv* env = NULL;
+  jclass activity_class = NULL;
+  if (!get_activity(&env, &activity_class)) return;
+  jmethodID method = (*env)->GetStaticMethodID(
+      env, activity_class, "setHomeStateFromNative",
+      "(Ljava/lang/String;Ljava/lang/String;II)V");
+  if (!method) {
+    (*env)->ExceptionClear(env);
+    SDL_Log("Wyrm home: setHomeStateFromNative unavailable");
+    (*env)->DeleteLocalRef(env, activity_class);
+    return;
+  }
+
+  jstring nickname = (*env)->NewStringUTF(env, settings->nickname);
+  jstring arena = (*env)->NewStringUTF(env, user_settings_arena(settings));
+  /* Score and kills come along so the profile has something true to show even
+   * before an account exists to sync them to. */
+  (*env)->CallStaticVoidMethod(env, activity_class, method, nickname, arena,
+                               (jint)settings->score, (jint)settings->kills);
+  clear_exception(env);
+  if (nickname) (*env)->DeleteLocalRef(env, nickname);
+  if (arena) (*env)->DeleteLocalRef(env, arena);
+  (*env)->DeleteLocalRef(env, activity_class);
+}
+
+void android_home_arena_refused(const char* endpoint, int seconds) {
+  if (!endpoint || !endpoint[0] || seconds <= 0) return;
+
+  JNIEnv* env = NULL;
+  jclass activity_class = NULL;
+  if (!get_activity(&env, &activity_class)) return;
+  jmethodID method = (*env)->GetStaticMethodID(
+      env, activity_class, "setArenaRefusedFromNative",
+      "(Ljava/lang/String;I)V");
+  if (!method) {
+    /* Additive on the Java side, so an engine running against an older shell
+       simply keeps the mark to itself rather than failing the join. */
+    (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, activity_class);
+    return;
+  }
+
+  jstring arena = (*env)->NewStringUTF(env, endpoint);
+  (*env)->CallStaticVoidMethod(env, activity_class, method, arena,
+                               (jint)seconds);
+  clear_exception(env);
+  if (arena) (*env)->DeleteLocalRef(env, arena);
+  (*env)->DeleteLocalRef(env, activity_class);
+}
+
+/*
+ * Arena drops (OM, 2026-09-29).
+ *
+ * Text from the arena crosses JNI as modified UTF-8, and a stray byte there is
+ * an abort under CheckJNI, so anything the arena wrote is cut down to plain
+ * printable ASCII first. That is all a close reason has ever needed.
+ */
+static void drop_copy_text(char* out, size_t cap, const char* text,
+                           size_t len) {
+  if (!out || cap == 0) return;
+  size_t n = 0;
+  for (size_t i = 0; text && i < len && text[i] && n + 1 < cap; i++) {
+    unsigned char ch = (unsigned char)text[i];
+    out[n++] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '?';
+  }
+  out[n] = '\0';
+}
+
+void android_home_arena_socket_opened(void) {
+  drop_close_code = 0;
+  drop_close_reason[0] = '\0';
+  drop_error_text[0] = '\0';
+  drop_errored = false;
+  prespawn_reported = false;
+  drop_timed_out = false;
+  join_was_sent = false;
+  join_packet_bytes = join_skin_bytes = join_skin_runs = join_nick_bytes = 0;
+  join_custom_skin = false;
+}
+
+void android_home_arena_join_sent(int packet_bytes, int skin_bytes,
+                                  int skin_runs, int nick_bytes,
+                                  bool custom_skin) {
+  join_was_sent = true;
+  join_packet_bytes = packet_bytes;
+  join_skin_bytes = skin_bytes;
+  join_skin_runs = skin_runs;
+  join_nick_bytes = nick_bytes;
+  join_custom_skin = custom_skin;
+}
+
+void android_home_arena_note_timeout(void) { drop_timed_out = true; }
+
+void android_home_arena_close_frame(const char* payload, size_t len) {
+  if (!payload || len < 2) {
+    drop_close_code = 0;
+    drop_close_reason[0] = '\0';
+    return;
+  }
+  drop_close_code = ((unsigned char)payload[0] << 8) | (unsigned char)payload[1];
+  /* At most 120 characters of reason, as the report carries it. */
+  drop_copy_text(drop_close_reason, sizeof(drop_close_reason), payload + 2,
+                 len - 2 > 120 ? 120 : len - 2);
+  SDL_Log("Wyrm arena: close frame %d '%s'", drop_close_code,
+          drop_close_reason);
+}
+
+void android_home_arena_error(const char* text) {
+  drop_errored = true;
+  drop_copy_text(drop_error_text, sizeof(drop_error_text), text,
+                 text ? strlen(text) : 0);
+}
+
+/* One `key=value` line. Values are already single-line ASCII. */
+static void drop_put(char* buf, size_t cap, size_t* used, const char* key,
+                     const char* value) {
+  if (*used >= cap) return;
+  int wrote = snprintf(buf + *used, cap - *used, "%s=%s\n", key,
+                       value ? value : "");
+  if (wrote < 0) return;
+  *used += (size_t)wrote;
+  if (*used >= cap) *used = cap - 1;
+}
+
+static void drop_put_int(char* buf, size_t cap, size_t* used, const char* key,
+                         long long value) {
+  char number[32];
+  snprintf(number, sizeof(number), "%lld", value);
+  drop_put(buf, cap, used, key, number);
+}
+
+/*
+ * A snake the arena ends within this long of spawning was dropped, not beaten:
+ * the arena takes it with a 'v' 0.3 to 1 s after it appears (OM, 2026-09-29).
+ */
+#define WYRM_FAST_DEATH_SEC 1.5
+
+/* Whether this life can still be reported: once per life, a live arena
+   snake, and not the player leaving. */
+static bool drop_can_report(game_data* gdata) {
+  return !drop_reported && !gdata->ai_mode && gdata->join_spawned &&
+         !gdata->closed_by_us && !gdata->leaving && !gdata->restart_req &&
+         !android_home_death_pending();
+}
+
+static void arena_drop_report(tenv* env, const char* reason, int death_code);
+
+/* Auto restart off after an arena drop (OM, 2026-10-05). A drop and an instant
+   rejoin could chase each other round and round (and earn the arena's IP
+   penalty), so any drop the app reports turns the toggle off; the player turns
+   it back on. Saved at once, so it goes to the account too. */
+static void drop_ends_auto_restart(tenv* env) {
+  user_settings* auto_settings = &env->usr->usrs;
+  if (!auto_settings->auto_respawn) return;
+  auto_settings->auto_respawn = 0;
+  save_user_settings(auto_settings);
+  SDL_Log("Wyrm: auto restart turned off (arena drop)");
+}
+
+void android_home_arena_drop(tenv* env) {
+  if (!env) return;
+  /* Evaluated before `android_home_notify_death`: once that has run a death is
+     always pending, and a real death (a 'v' first) already made it pending. */
+  if (!drop_can_report(&env->usr->gdata)) return;
+  arena_drop_report(env, drop_errored ? "error" : "closed", -1);
+}
+
+void android_home_arena_fast_death(tenv* env, int death_code) {
+  if (!env) return;
+  game_data* gdata = &env->usr->gdata;
+  if (!drop_can_report(gdata)) return;
+  double life = glfwGetTime() - gdata->life_started_sec;
+  if (life < 0 || life >= WYRM_FAST_DEATH_SEC) return;
+  arena_drop_report(env, "death_packet", death_code);
+}
+
+static void arena_drop_report(tenv* env, const char* reason, int death_code) {
+  game_data* gdata = &env->usr->gdata;
+  user_settings* settings = &env->usr->usrs;
+  drop_reported = true;
+  /* Before the death that follows ('v' path): no auto restart after a drop. */
+  drop_ends_auto_restart(env);
+
+  /* The same numbers `game_capture_final_score` reads, without writing any of
+     them: the death that follows still records the run exactly as before. */
+  int score = gdata->data.score;
+  int length = 0;
+  int kills = gdata->data.kills;
+  size_t count = tdarray_length(gdata->data.snakes);
+  if (count && gdata->data.snakes[count - 1].local_player) {
+    snake* me = gdata->data.snakes + count - 1;
+    length = me->sct;
+    kills = (int)me->kill_count;
+    int sct = me->sct + me->rsc;
+    int limit = (int)tdarray_length(gdata->data.fpsls) - 1;
+    if (sct >= 0 && sct <= limit && gdata->data.fmlts[sct] > 0)
+      score = (int)floorf((gdata->data.fpsls[sct] +
+          me->fam / gdata->data.fmlts[sct] - 1) * 15 - 5);
+  }
+  double life = glfwGetTime() - gdata->life_started_sec;
+  if (life < 0) life = 0;
+  uint64_t now = SDL_GetTicks();
+  uint64_t quiet = now >= gdata->last_packet_ms ? now - gdata->last_packet_ms : 0;
+  /* Dial to spawn: how long the arena took to hand over a snake. */
+  long long since_dial = gdata->attempt_started_ms && now >= gdata->attempt_started_ms
+      ? (long long)(now - gdata->attempt_started_ms) : -1;
+  long long dial_to_spawn = since_dial >= 0 ? since_dial - (long long)(life * 1000.0) : -1;
+  if (dial_to_spawn < 0 && since_dial >= 0) dial_to_spawn = 0;
+  char arena[MAX_ARENA_LEN + 1];
+  drop_copy_text(arena, sizeof(arena), user_settings_arena(settings), strlen(user_settings_arena(settings)));
+  char persona[48];
+  const char* persona_name = arena_persona_get(gdata->persona)->name;
+  drop_copy_text(persona, sizeof(persona), persona_name,
+                 persona_name ? strlen(persona_name) : 0);
+  char life_text[32];
+  snprintf(life_text, sizeof(life_text), "%.1f", life);
+
+  char packed[1024];
+  size_t used = 0;
+  packed[0] = '\0';
+  drop_put(packed, sizeof(packed), &used, "dropReason", reason);
+  drop_put_int(packed, sizeof(packed), &used, "deathPacket", death_code);
+  drop_put_int(packed, sizeof(packed), &used, "dialToSpawnMs", dial_to_spawn);
+  drop_put_int(packed, sizeof(packed), &used, "closeCode", drop_close_code);
+  drop_put(packed, sizeof(packed), &used, "closeReason", drop_close_reason);
+  drop_put(packed, sizeof(packed), &used, "errorText", drop_error_text);
+  drop_put(packed, sizeof(packed), &used, "lifeSec", life_text);
+  drop_put_int(packed, sizeof(packed), &used, "score", score);
+  drop_put_int(packed, sizeof(packed), &used, "length", length);
+  drop_put_int(packed, sizeof(packed), &used, "kills", kills);
+  drop_put_int(packed, sizeof(packed), &used, "pingMs", gdata->data.ping);
+  drop_put_int(packed, sizeof(packed), &used, "pingPeakMs", gdata->data.ping_peak);
+  drop_put_int(packed, sizeof(packed), &used, "lagging",
+               gdata->data.lagging ? 1 : 0);
+  drop_put_int(packed, sizeof(packed), &used, "fps", gdata->data.fps);
+  drop_put_int(packed, sizeof(packed), &used, "lastPacketAgoMs",
+               (long long)quiet);
+  drop_put_int(packed, sizeof(packed), &used, "connectsLastMin",
+               server_connects_last_minute());
+  drop_put(packed, sizeof(packed), &used, "persona", persona);
+  drop_put_int(packed, sizeof(packed), &used, "protocol",
+               gdata->data.protocol_version);
+  drop_put(packed, sizeof(packed), &used, "arena", arena);
+  SDL_Log("Wyrm arena: drop after %ss — %s (v %d), close %d '%s' %s",
+          life_text, reason, death_code, drop_close_code, drop_close_reason,
+          drop_error_text);
+
+  JNIEnv* jni = NULL;
+  jclass activity_class = NULL;
+  if (!get_activity(&jni, &activity_class)) return;
+  jmethodID method = (*jni)->GetStaticMethodID(
+      jni, activity_class, "setArenaDropFromNative", "(Ljava/lang/String;)V");
+  if (!method) {
+    /* An older shell has no drop card; the match ends as it always did. */
+    (*jni)->ExceptionClear(jni);
+    (*jni)->DeleteLocalRef(jni, activity_class);
+    return;
+  }
+  jstring text = (*jni)->NewStringUTF(jni, packed);
+  if (text) {
+    (*jni)->CallStaticVoidMethod(jni, activity_class, method, text);
+    clear_exception(jni);
+    (*jni)->DeleteLocalRef(jni, text);
+  } else {
+    clear_exception(jni);
+  }
+  (*jni)->DeleteLocalRef(jni, activity_class);
+}
+
+void android_home_arena_prespawn_close(tenv* env, const char* phase) {
+  if (!env || prespawn_reported) return;
+  game_data* gdata = &env->usr->gdata;
+  user_settings* settings = &env->usr->usrs;
+  if (gdata->ai_mode || gdata->join_spawned || gdata->closed_by_us ||
+      gdata->leaving || gdata->restart_req)
+    return;
+  prespawn_reported = true;
+  drop_ends_auto_restart(env);
+
+  uint64_t now = SDL_GetTicks();
+  long long since_dial = gdata->attempt_started_ms && now >= gdata->attempt_started_ms
+      ? (long long)(now - gdata->attempt_started_ms) : -1;
+  const char* reason = drop_timed_out ? "prespawn_timeout"
+                       : drop_errored ? "prespawn_error" : "prespawn_closed";
+  char arena[MAX_ARENA_LEN + 1];
+  drop_copy_text(arena, sizeof(arena), user_settings_arena(settings), strlen(user_settings_arena(settings)));
+  char persona[48];
+  const char* persona_name = arena_persona_get(gdata->persona)->name;
+  drop_copy_text(persona, sizeof(persona), persona_name,
+                 persona_name ? strlen(persona_name) : 0);
+  char phase_text[64];
+  drop_copy_text(phase_text, sizeof(phase_text), phase, phase ? strlen(phase) : 0);
+  char traffic[320] = {0};
+  arena_trace_summary(traffic, sizeof(traffic));
+  char trace[240];
+  drop_copy_text(trace, sizeof(trace), traffic, strlen(traffic));
+
+  char packed[1024];
+  size_t used = 0;
+  packed[0] = '\0';
+  drop_put(packed, sizeof(packed), &used, "dropReason", reason);
+  drop_put(packed, sizeof(packed), &used, "phase", phase_text);
+  drop_put_int(packed, sizeof(packed), &used, "msSinceDial", since_dial);
+  drop_put_int(packed, sizeof(packed), &used, "joinSent", join_was_sent ? 1 : 0);
+  drop_put_int(packed, sizeof(packed), &used, "joinBytes", join_packet_bytes);
+  drop_put_int(packed, sizeof(packed), &used, "customSkin", join_custom_skin ? 1 : 0);
+  drop_put_int(packed, sizeof(packed), &used, "skinBytes", join_skin_bytes);
+  drop_put_int(packed, sizeof(packed), &used, "skinRuns", join_skin_runs);
+  drop_put_int(packed, sizeof(packed), &used, "nickBytes", join_nick_bytes);
+  drop_put_int(packed, sizeof(packed), &used, "closeCode", drop_close_code);
+  drop_put(packed, sizeof(packed), &used, "closeReason", drop_close_reason);
+  drop_put(packed, sizeof(packed), &used, "errorText", drop_error_text);
+  drop_put(packed, sizeof(packed), &used, "lifeSec", "0");
+  drop_put_int(packed, sizeof(packed), &used, "connectsLastMin",
+               server_connects_last_minute());
+  drop_put(packed, sizeof(packed), &used, "persona", persona);
+  drop_put(packed, sizeof(packed), &used, "arena", arena);
+  drop_put(packed, sizeof(packed), &used, "trace", trace);
+  SDL_Log("Wyrm arena: turned away %s (%s) — join %d bytes, skin %d runs",
+          phase_text, reason, join_packet_bytes, join_skin_runs);
+
+  JNIEnv* jni = NULL;
+  jclass activity_class = NULL;
+  if (!get_activity(&jni, &activity_class)) return;
+  jmethodID method = (*jni)->GetStaticMethodID(
+      jni, activity_class, "setArenaDropFromNative", "(Ljava/lang/String;)V");
+  if (!method) {
+    (*jni)->ExceptionClear(jni);
+    (*jni)->DeleteLocalRef(jni, activity_class);
+    return;
+  }
+  jstring text = (*jni)->NewStringUTF(jni, packed);
+  if (text) {
+    (*jni)->CallStaticVoidMethod(jni, activity_class, method, text);
+    clear_exception(jni);
+    (*jni)->DeleteLocalRef(jni, text);
+  } else {
+    clear_exception(jni);
+  }
+  (*jni)->DeleteLocalRef(jni, activity_class);
+}
+
+bool android_home_death_active(void) { return death_active; }
+
+/**
+ * Puts the card up. Nothing spawns behind it.
+ *
+ * It used to hand the arena to the bot and take a fresh snake immediately, so
+ * the card sat over a live game. That is gone: the player asked for the
+ * spawning to stop, and it was the spawning that made death feel like being
+ * shoved back in before you had looked at what happened. The arena is left as
+ * it is — usually already hung up — and the card covers it.
+ */
+static void raise_death_card(tenv* env) {
+  tuser_data* user = env->usr;
+  game_data* gdata = &user->gdata;
+  user_settings* settings = &user->usrs;
+
+  death_active = true;
+  gdata->restart_req = false;
+
+  if (gdata->connection) game_close_connection(gdata, "died");
+
+  JNIEnv* jni = NULL;
+  jclass activity_class = NULL;
+  if (!get_activity(&jni, &activity_class)) return;
+  jmethodID method = (*jni)->GetStaticMethodID(jni, activity_class,
+                                               "setDeathFromNative", "(ZIIDZ)V");
+  if (!method) {
+    (*jni)->ExceptionClear(jni);
+    SDL_Log("Wyrm home: setDeathFromNative unavailable");
+    (*jni)->DeleteLocalRef(jni, activity_class);
+    return;
+  }
+  (*jni)->CallStaticVoidMethod(jni, activity_class, method, JNI_TRUE,
+                               (jint)settings->score, (jint)settings->kills,
+                               (jdouble)settings->play_time,
+                               settings->auto_respawn ? JNI_TRUE : JNI_FALSE);
+  clear_exception(jni);
+  (*jni)->DeleteLocalRef(jni, activity_class);
+}
+
+static void return_to_lobby_after_death(tenv* env) {
+  death_watching = false;
+  death_active = false;
+  env->usr->gdata.restart_req = false;
+  env->usr->gdata.leaving = false;
+  env->usr->gdata.stay_in_lobby = true;
+  env->usr->gdata.curr_screen = LOBBY;
+  /* A champion's socket remains open for the separate victory exchange. */
+  if (!env->usr->gdata.data.victory_message_requested ||
+      env->usr->gdata.data.want_close_socket) {
+    env->usr->gdata.leaving = true;
+    game_close_connection(&env->usr->gdata, "died — back to lobby");
+  }
+  SDL_Log("Wyrm death: returning to lobby");
+}
+
+void android_home_notify_death(tenv* env) {
+  if (!env) return;
+  /* The reference refreshes dead_mtm on another 'v' or an in-game close.
+     Keep its presentation clock separate from our once-per-life receipt. */
+  if (!death_watching) death_opacity = 1;
+  android_team_release_chat(env);
+  if (!run_recorded) {
+    game_capture_final_score(env);
+    if (env->usr->gdata.join_spawned) record_finished_run(env);
+    run_recorded = true;
+  }
+  /* Auto restart (OM, 2026-10-05): with the on-screen toggle on, a kill is
+     answered with Restart at once, as if the Restart key were pressed: no
+     death wait, no lobby. Only for a real kill on an open arena socket (a
+     drop still goes to the lobby and its report), and never during a
+     champion's victory exchange. The rejoin keeps the arena's cooldowns. */
+  game_data* auto_gdata = &env->usr->gdata;
+  /* A second death report while that restart closes changes nothing. */
+  if (auto_restart_closing && auto_gdata->restart_req) return;
+  auto_restart_closing = false;
+  if (env->usr->usrs.auto_respawn && auto_gdata->connection &&
+      auto_gdata->join_spawned && !auto_gdata->data.victory_message_requested) {
+    death_watching = false;
+    death_active = false;
+    auto_gdata->data.follow_view = false;
+    auto_gdata->leaving = false;
+    auto_gdata->restart_req = true;
+    auto_restart_closing = true;
+    game_close_connection(auto_gdata, "auto restart");
+    SDL_Log("Wyrm death: auto restart");
+    return;
+  }
+  env->usr->gdata.data.follow_view = false;
+  env->usr->gdata.data.lagging = false;
+  env->usr->gdata.data.lag_mult = 1;
+  env->usr->gdata.restart_req = false;
+  env->usr->gdata.leaving = false;
+  death_watching = true;
+  death_began_at = SDL_GetTicks();
+  SDL_Log("Wyrm death: 1600 ms wait, then source-rate fade");
+}
+
+bool android_home_death_pending(void) { return death_watching || death_active; }
+
+/* Phase 3 H (OM, 2026-10-01): the HUD's performance chip ("Cooling down ·
+   60 FPS"). The app decides the text (Settings › Performance, Auto mode only)
+   and the engine only draws it. Two slots and an atomic index: the UI thread
+   writes the slot not being shown, the render thread reads the shown one. The
+   last byte of each slot is never written, so a read always ends. */
+static char performance_chip_text[2][48];
+static SDL_AtomicInt performance_chip_slot;
+
+void android_home_set_performance_chip(const char* text) {
+  int next = 1 - SDL_GetAtomicInt(&performance_chip_slot);
+  snprintf(performance_chip_text[next], sizeof(performance_chip_text[next]) - 1,
+           "%s", text ? text : "");
+  SDL_SetAtomicInt(&performance_chip_slot, next);
+}
+
+const char* android_home_performance_chip(void) {
+  return performance_chip_text[SDL_GetAtomicInt(&performance_chip_slot)];
+}
+
+/* Assist laser in joystick mode (OM, 2026-10-01): set by the app, read by
+   ui_overlay.c every frame. Length is kept in thousandths. */
+static SDL_AtomicInt joystick_laser_on_flag;
+static SDL_AtomicInt joystick_laser_milli;
+
+void android_home_set_joystick_laser(bool on, float length) {
+  if (!(length >= 0.1f)) length = 0.1f;
+  if (length > 1.0f) length = 1.0f;
+  SDL_SetAtomicInt(&joystick_laser_milli, (int)(length * 1000.0f + 0.5f));
+  SDL_SetAtomicInt(&joystick_laser_on_flag, on ? 1 : 0);
+}
+
+bool android_home_joystick_laser_on(void) {
+  return SDL_GetAtomicInt(&joystick_laser_on_flag) != 0;
+}
+
+float android_home_joystick_laser_length(void) {
+  int milli = SDL_GetAtomicInt(&joystick_laser_milli);
+  return milli > 0 ? milli / 1000.0f : 0.45f;
+}
+
+/* Near Original (OM, 2026-10-02): set by the app (Home), read by
+   ui_overlay.c and mobile_controls.c every frame. */
+static SDL_AtomicInt near_original_flag;
+static SDL_AtomicInt near_original_server;
+
+void android_home_set_near_original(bool on, int server) {
+  SDL_SetAtomicInt(&near_original_server, server > 0 ? server : 0);
+  SDL_SetAtomicInt(&near_original_flag, on ? 1 : 0);
+}
+
+bool android_home_near_original(void) {
+  return SDL_GetAtomicInt(&near_original_flag) != 0;
+}
+
+int android_home_near_original_server(void) {
+  return SDL_GetAtomicInt(&near_original_server);
+}
+
+float android_home_death_opacity(void) { return death_watching ? death_opacity : 1; }
+
+void android_home_advance_death(tenv* env, float vfr) {
+  if (!death_watching) return;
+  death_opacity = arena_death_step(death_opacity,
+      SDL_GetTicks() - death_began_at, vfr);
+  if (death_opacity <= 0) return_to_lobby_after_death(env);
+}
+
+/** Takes the card down, restoring whatever bot setting the player had. */
+static void dismiss_death(tenv* env) {
+  /* A watch still running belongs to this death and goes with it — leaving one
+     armed would raise a card over the match the player just asked for. */
+  death_watching = false;
+  if (!death_active) return;
+  death_active = false;
+  /* The bot is not restored here any more, because nothing forces it on any
+     more. It was this line, fed by a value chat had already changed, that left
+     a new match starting with the bot driving and no way to stop it. */
+
+  JNIEnv* jni = NULL;
+  jclass activity_class = NULL;
+  if (!get_activity(&jni, &activity_class)) return;
+  jmethodID method = (*jni)->GetStaticMethodID(jni, activity_class,
+                                               "setDeathFromNative", "(ZIIDZ)V");
+  if (method) {
+    (*jni)->CallStaticVoidMethod(jni, activity_class, method, JNI_FALSE, 0, 0,
+                                 (jdouble)0, JNI_FALSE);
+    clear_exception(jni);
+  } else {
+    (*jni)->ExceptionClear(jni);
+  }
+  (*jni)->DeleteLocalRef(jni, activity_class);
+}
+
+void android_home_poll(tenv* env) {
+  if (!env || !home_mutex) return;
+
+
+  bool enter = false;
+  bool ai_enter = false;
+  bool ai_editor_enter = false;
+  bool ai_editor_exit = false;
+  bool editor_leaderboard_toggle = false;
+  char nickname[MAX_NICKNAME_LEN + 1] = {0};
+  bool save_nickname = false;
+  char saved_nickname[MAX_NICKNAME_LEN + 1] = {0};
+  char arena[MAX_ARENA_LEN + 1] = {0};
+  char enter_arena[MAX_ARENA_LEN + 1] = {0};
+  uint64_t enter_id = 0;
+  int requested = -1;
+  bool death_play, death_home;
+
+  SDL_LockMutex(home_mutex);
+  enter = pending_enter;
+  ai_enter = pending_ai_enter;
+  ai_editor_enter = pending_ai_editor_enter;
+  ai_editor_exit = pending_ai_editor_exit;
+  editor_leaderboard_toggle = pending_editor_leaderboard_toggle;
+  if (enter || ai_enter || ai_editor_enter) {
+    memcpy(nickname, pending_nickname, sizeof(nickname));
+  }
+  if (enter) {
+    memcpy(enter_arena, pending_enter_arena, sizeof(enter_arena));
+    enter_id = pending_enter_id;
+  }
+  save_nickname = pending_nickname_save;
+  if (save_nickname) {
+    memcpy(saved_nickname, pending_saved_nickname, sizeof(saved_nickname));
+  }
+  memcpy(arena, pending_arena, sizeof(arena));
+  requested = pending_screen;
+  death_play = pending_death_play;
+  death_home = pending_death_home;
+  int auto_respawn = pending_auto_respawn;
+  pending_auto_respawn = -1;
+  pending_enter = false;
+  pending_ai_enter = false;
+  pending_ai_editor_enter = false;
+  pending_ai_editor_exit = false;
+  pending_editor_leaderboard_toggle = false;
+  pending_nickname_save = false;
+  pending_enter_arena[0] = '\0';
+  pending_enter_id = 0;
+  pending_arena[0] = '\0';
+  pending_screen = -1;
+  pending_death_play = false;
+  pending_death_home = false;
+  SDL_UnlockMutex(home_mutex);
+
+  tuser_data* user = env->usr;
+  user_settings* settings = &user->usrs;
+
+  if (editor_leaderboard_toggle && ai_mode_is_editor())
+    ui_overlay_toggle_leaderboard(env);
+
+  if (ai_editor_exit) {
+    if (user->gdata.ai_mode) ai_mode_finish_editor(env);
+    return;
+  }
+
+  if (ai_editor_enter) {
+    snprintf(settings->nickname, sizeof(settings->nickname), "%s", nickname);
+    ai_mode_start_editor(env, nickname);
+    return;
+  }
+
+  if (ai_enter) {
+    snprintf(settings->nickname, sizeof(settings->nickname), "%s", nickname);
+    save_user_settings(settings);
+    ai_mode_start(env, nickname);
+    return;
+  }
+
+  if (save_nickname &&
+      strncmp(settings->nickname, saved_nickname, sizeof(settings->nickname)) != 0) {
+    snprintf(settings->nickname, sizeof(settings->nickname), "%s", saved_nickname);
+    save_user_settings(settings);
+    SDL_Log("Wyrm home: in-game name saved");
+    android_home_publish_state(env);
+  }
+
+  if (auto_respawn >= 0 && settings->auto_respawn != auto_respawn) {
+    settings->auto_respawn = auto_respawn;
+    save_user_settings(settings);
+    SDL_Log("Wyrm: auto respawn %s", auto_respawn ? "on" : "off");
+  }
+
+  if (death_play) {
+    dismiss_death(env);
+    /*
+     * Play on the card is the restart hotkey, pressed for the player.
+     *
+     * It used to be its own copy of the entry sequence, which is how the two
+     * came to disagree about pacing — the hotkey went through the loop and this
+     * dialled on the spot. There is one way into an arena now and both use it,
+     * so a rule added to entry cannot apply to only half of the ways in.
+     *
+     * The socket is already closed by the time the card is up: `raise_death_card`
+     * hangs up, so there is nothing to hand back first.
+     */
+    if (user->gdata.connection && user->gdata.conn == CONNECTED) {
+      user->gdata.restart_req = true;
+      game_close_connection(&user->gdata, "play again");
+    } else {
+      arena_request_join(env, ARENA_CONNECT_COOLDOWN_MS);
+    }
+  }
+
+  if (death_home) {
+    dismiss_death(env);
+    user->gdata.leaving = true;
+    user->gdata.restart_req = false;
+    game_close_connection(&user->gdata, "home from the death card");
+    user->gdata.curr_screen = TITLE_SCREEN;
+  }
+
+  if (arena[0]) {
+    /* Chosen in Compose, persisted here: the engine owns the settings file, and
+     * writing it now means the choice survives even if the app is killed on the
+     * way into the match. */
+    if (server_address_is_valid(arena)) {
+      SDL_Log("Wyrm home: arena set to '%s'", arena);
+      user_settings_set_arena(settings, arena);
+      save_user_settings(settings);
+      android_home_publish_state(env);
+    } else {
+      SDL_Log("Wyrm home: invalid arena ignored: '%s'", arena);
+    }
+  }
+
+  if (requested >= 0) {
+    user->gdata.curr_screen = (screen)requested;
+    if (requested == LOBBY) {
+      user->gdata.stay_in_lobby = true;
+      user->gdata.leaving = false;
+      user->gdata.restart_req = false;
+    }
+  }
+
+  if (enter) {
+    game_data* gdata = &user->gdata;
+    /* The reference hides Play while joining. A second queued press cannot
+     * close that socket and manufacture another dial; the active attempt owns
+     * its timeout and reports its terminal result before another Play. */
+    if (enter_id <= last_enter_id) {
+      SDL_Log("Wyrm home: stale arena attempt %llu ignored",
+              (unsigned long long)enter_id);
+      android_home_arena_enter_ignored();
+      return;
+    }
+    last_enter_id = enter_id;
+    if (!server_address_is_valid(enter_arena)) {
+      SDL_Log("Wyrm home: arena attempt %llu has invalid address '%s'",
+              (unsigned long long)enter_id, enter_arena);
+      android_home_arena_enter_ignored();
+      return;
+    }
+    if (gdata->connection || gdata->conn != DISCONNECTED) {
+      SDL_Log("Wyrm home: arena attempt %llu ignored; a join is already active",
+              (unsigned long long)enter_id);
+      android_home_arena_enter_ignored();
+      return;
+    }
+
+    SDL_Log("Wyrm home: entering '%s' as '%s' (attempt %llu)", enter_arena,
+            nickname, (unsigned long long)enter_id);
+    /* Compose owns the name, so the engine takes it as given and persists it
+     * before the match rather than after, in case the match never ends well. */
+    snprintf(settings->nickname, sizeof(settings->nickname), "%s", nickname);
+    user_settings_set_arena(settings, enter_arena);
+    save_user_settings(settings);
+
+    ui_lobby_play(env);
+  }
+}
+
+/** Compose asking for auto respawn on or off, from the death card. */
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetAutoRespawn(JNIEnv* env,
+                                                          jclass clazz,
+                                                          jboolean on) {
+  (void)env;
+  (void)clazz;
+  if (!home_mutex) return;
+  SDL_LockMutex(home_mutex);
+  pending_auto_respawn = on ? 1 : 0;
+  SDL_UnlockMutex(home_mutex);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetNickname(JNIEnv* env,
+                                                       jclass clazz,
+                                                       jstring nickname) {
+  (void)clazz;
+  if (!home_mutex) return;
+  const char* text = nickname ? (*env)->GetStringUTFChars(env, nickname, NULL)
+                              : NULL;
+  SDL_LockMutex(home_mutex);
+  snprintf(pending_saved_nickname, sizeof(pending_saved_nickname), "%s",
+           text ? text : "");
+  pending_nickname_save = true;
+  SDL_UnlockMutex(home_mutex);
+  if (text) (*env)->ReleaseStringUTFChars(env, nickname, text);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeEnterArena(JNIEnv* env, jclass clazz,
+                                                     jstring nickname,
+                                                     jstring address,
+                                                     jlong attempt_id) {
+  (void)clazz;
+  if (!home_mutex) return;
+
+  const char* text = nickname ? (*env)->GetStringUTFChars(env, nickname, NULL)
+                              : NULL;
+  const char* arena = address ? (*env)->GetStringUTFChars(env, address, NULL)
+                              : NULL;
+  SDL_Log("Wyrm home: nativeEnterArena reached (attempt %llu)",
+          (unsigned long long)attempt_id);
+  SDL_LockMutex(home_mutex);
+  snprintf(pending_nickname, sizeof(pending_nickname), "%s", text ? text : "");
+  snprintf(pending_enter_arena, sizeof(pending_enter_arena), "%s",
+           arena ? arena : "");
+  pending_enter_id = (uint64_t)attempt_id;
+  pending_enter = true;
+  SDL_UnlockMutex(home_mutex);
+  if (text) (*env)->ReleaseStringUTFChars(env, nickname, text);
+  if (arena) (*env)->ReleaseStringUTFChars(env, address, arena);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeEnterAiMode(JNIEnv* env,
+                                                       jclass clazz,
+                                                       jstring nickname) {
+  (void)clazz;
+  if (!home_mutex) return;
+  const char* text = nickname ? (*env)->GetStringUTFChars(env, nickname, NULL)
+                              : NULL;
+  SDL_LockMutex(home_mutex);
+  snprintf(pending_nickname, sizeof(pending_nickname), "%s", text ? text : "");
+  pending_ai_enter = true;
+  SDL_UnlockMutex(home_mutex);
+  if (text) (*env)->ReleaseStringUTFChars(env, nickname, text);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeEnterAiLayoutEditor(
+    JNIEnv* env, jclass clazz, jstring nickname) {
+  (void)clazz;
+  if (!home_mutex) return;
+  const char* text = nickname ? (*env)->GetStringUTFChars(env, nickname, NULL)
+                              : NULL;
+  SDL_LockMutex(home_mutex);
+  snprintf(pending_nickname, sizeof(pending_nickname), "%s", text ? text : "");
+  pending_ai_editor_enter = true;
+  SDL_UnlockMutex(home_mutex);
+  if (text) (*env)->ReleaseStringUTFChars(env, nickname, text);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeExitAiLayoutEditor(JNIEnv* env,
+                                                              jclass clazz) {
+  (void)env;
+  (void)clazz;
+  if (!home_mutex) return;
+  SDL_LockMutex(home_mutex);
+  pending_ai_editor_exit = true;
+  SDL_UnlockMutex(home_mutex);
+}
+
+/* The background-size editor: only the map and the board, assist off. */
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetEditorBare(JNIEnv* env,
+                                                         jclass clazz,
+                                                         jboolean bare) {
+  (void)env;
+  (void)clazz;
+  ai_mode_set_editor_bare(bare == JNI_TRUE);
+}
+
+/* Snake-look preview (OM, 2026-10-05): bare editor can show assist or normal. */
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetEditorAssist(JNIEnv* env,
+                                                          jclass clazz,
+                                                          jboolean on) {
+  (void)env;
+  (void)clazz;
+  ai_mode_set_editor_assist(on == JNI_TRUE);
+}
+
+/* Settings › Performance: present mode and frame cap (main.c). */
+extern void wyrm_set_frame_policy(int vsync, int cap);
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetFramePolicy(JNIEnv* env,
+                                                         jclass clazz,
+                                                         jboolean vsync,
+                                                         jint cap) {
+  (void)env;
+  (void)clazz;
+  wyrm_set_frame_policy(vsync == JNI_TRUE, (int)cap);
+}
+
+/* Home: Near Original (slither's own HUD and controls) and the arena's
+   number for its minimap label. */
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetNearOriginal(JNIEnv* env,
+                                                         jclass clazz,
+                                                         jboolean on,
+                                                         jint server) {
+  (void)env;
+  (void)clazz;
+  android_home_set_near_original(on == JNI_TRUE, (int)server);
+}
+
+/* Settings > Modes > Assist: the assist laser in joystick mode. */
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetJoystickLaser(JNIEnv* env,
+                                                          jclass clazz,
+                                                          jboolean on,
+                                                          jfloat length) {
+  (void)env;
+  (void)clazz;
+  android_home_set_joystick_laser(on == JNI_TRUE, (float)length);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetPerformanceChip(JNIEnv* env,
+                                                            jclass clazz,
+                                                            jstring text) {
+  (void)clazz;
+  const char* utf = text ? (*env)->GetStringUTFChars(env, text, NULL) : NULL;
+  android_home_set_performance_chip(utf ? utf : "");
+  if (utf) (*env)->ReleaseStringUTFChars(env, text, utf);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeToggleEditorLeaderboard(
+    JNIEnv* env, jclass clazz) {
+  (void)env;
+  (void)clazz;
+  if (!home_mutex) return;
+  SDL_LockMutex(home_mutex);
+  pending_editor_leaderboard_toggle = true;
+  SDL_UnlockMutex(home_mutex);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSelectArena(JNIEnv* env, jclass clazz,
+                                                      jstring address) {
+  (void)clazz;
+  if (!home_mutex) return;
+
+  const char* text = address ? (*env)->GetStringUTFChars(env, address, NULL)
+                             : NULL;
+  SDL_LockMutex(home_mutex);
+  snprintf(pending_arena, sizeof(pending_arena), "%s", text ? text : "");
+  SDL_UnlockMutex(home_mutex);
+  if (text) (*env)->ReleaseStringUTFChars(env, address, text);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeDeathPlay(JNIEnv* env, jclass clazz) {
+  (void)env;
+  (void)clazz;
+  if (!home_mutex) return;
+  SDL_LockMutex(home_mutex);
+  pending_death_play = true;
+  SDL_UnlockMutex(home_mutex);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeDeathHome(JNIEnv* env, jclass clazz) {
+  (void)env;
+  (void)clazz;
+  if (!home_mutex) return;
+  SDL_LockMutex(home_mutex);
+  pending_death_home = true;
+  SDL_UnlockMutex(home_mutex);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeOpenScreen(JNIEnv* env, jclass clazz,
+                                                     jint screen) {
+  (void)env;
+  (void)clazz;
+  if (!home_mutex) return;
+  SDL_LockMutex(home_mutex);
+  pending_screen = (int)screen;
+  SDL_UnlockMutex(home_mutex);
+}
+
+
+/* Play feel (OM, 2026-10-05): Settings > Controls (PlayFeelStore). */
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetPlayFeel(JNIEnv* env,
+                                                      jclass clazz,
+                                                      jboolean original_arrow,
+                                                      jboolean look_ahead,
+                                                      jint zoom_style) {
+  (void)env;
+  (void)clazz;
+  mobile_controls_set_play_feel(original_arrow == JNI_TRUE,
+                                look_ahead == JNI_TRUE, (int)zoom_style);
+}
+
+#else
+
+void android_home_bind_env(tenv* env) { (void)env; }
+void android_home_poll(tenv* env) { (void)env; }
+void android_home_begin_life(void) {}
+void android_home_reset_death(void) {}
+void android_home_set_screen(int screen) { (void)screen; }
+void android_home_set_arena_port_available(bool available) { (void)available; }
+void android_home_arena_enter_ignored(void) {}
+void android_home_publish_state(tenv* env) { (void)env; }
+void android_home_notify_death(tenv* env) { (void)env; }
+bool android_home_death_active(void) { return false; }
+bool android_home_death_pending(void) { return false; }
+float android_home_death_opacity(void) { return 1; }
+void android_home_advance_death(tenv* env, float vfr) { (void)env; (void)vfr; }
+void android_home_arena_refused(const char* endpoint, int seconds) {
+  (void)endpoint;
+  (void)seconds;
+}
+void android_home_arena_socket_opened(void) {}
+void android_home_arena_close_frame(const char* payload, size_t len) {
+  (void)payload;
+  (void)len;
+}
+void android_home_arena_error(const char* text) { (void)text; }
+void android_home_arena_drop(tenv* env) { (void)env; }
+void android_home_arena_fast_death(tenv* env, int death_code) {
+  (void)env;
+  (void)death_code;
+}
+void android_home_arena_join_sent(int packet_bytes, int skin_bytes,
+                                  int skin_runs, int nick_bytes,
+                                  bool custom_skin) {
+  (void)packet_bytes;
+  (void)skin_bytes;
+  (void)skin_runs;
+  (void)nick_bytes;
+  (void)custom_skin;
+}
+void android_home_arena_note_timeout(void) {}
+void android_home_arena_prespawn_close(tenv* env, const char* phase) {
+  (void)env;
+  (void)phase;
+}
+
+#endif

@@ -1,0 +1,361 @@
+#ifndef USER_SETTINGS_H
+#define USER_SETTINGS_H
+
+#include <cglm/cglm.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+
+#include "../constants.h"
+
+typedef struct hotkey {
+  int key;
+  bool active;
+  int mode;
+  char description[MAX_HOTKEY_DESC_LENGTH + 1];
+} hotkey;
+
+typedef struct gameplay_mode {
+  bool food_flicker;
+  bool food_float;
+  bool uniform_food_color;
+  bool show_crosshair;
+  bool show_boost;
+  bool show_shadows;
+  bool show_background;
+  bool show_accessories;
+  bool death_effect;
+  bool player_names_outline;
+  bool const_food_scale;
+  int food_type;
+  int boost_type;
+  int render_mode;
+  float food_scale;
+  float qsm;
+  float bg_scale;
+  float boost_strength;
+  vec3 food_color;
+} gameplay_mode;
+
+typedef enum mobile_handedness {
+  MOBILE_LEFT_HANDED = 0,
+  MOBILE_RIGHT_HANDED = 1
+} mobile_handedness;
+
+typedef enum mobile_joystick_mode {
+  MOBILE_JOYSTICK_DYNAMIC = 0,
+  MOBILE_JOYSTICK_FIXED = 1,
+  MOBILE_STEERING_ARROW = 2
+} mobile_joystick_mode;
+
+typedef enum mobile_boost_mode {
+  MOBILE_BOOST_TOUCH_ZONE = 0,
+  MOBILE_BOOST_FIXED = 1
+} mobile_boost_mode;
+
+typedef enum mobile_zoom_orientation {
+  MOBILE_ZOOM_HORIZONTAL = 0,
+  MOBILE_ZOOM_VERTICAL = 1
+} mobile_zoom_orientation;
+
+typedef struct mobile_control_settings {
+  int handedness;
+  int joystick_mode;
+  int boost_mode;
+  int zoom_orientation;
+  bool zoom_enabled;
+  bool show_touch_zones;
+  float joystick_x;
+  float joystick_y;
+  float boost_x;
+  float boost_y;
+  float zoom_x;
+  float zoom_y;
+  float joystick_size;
+  float boost_size;
+  float zoom_length;
+  float opacity;
+} mobile_control_settings;
+
+typedef struct mobile_arrow_settings {
+  bool boost_glow;
+  float size;
+  float separation;
+  float smoothness;
+  float color[4];
+} mobile_arrow_settings;
+
+typedef enum mobile_arrow_style {
+  MOBILE_ARROW_CURRENT = 0,
+  MOBILE_ARROW_CLASSIC_WIDE = 1,
+  MOBILE_ARROW_NEEDLE = 2,
+  MOBILE_ARROW_BLADE = 3,
+  MOBILE_ARROW_TRIANGLE = 4,
+  /* slither's own arrow (Near Original, 2026-10-02). Older builds clamp it. */
+  MOBILE_ARROW_ORIGINAL = 5
+} mobile_arrow_style;
+
+typedef struct mobile_hotkey_settings {
+  bool visible[NUM_MOBILE_HOTKEYS];
+  float x[NUM_MOBILE_HOTKEYS];
+  float y[NUM_MOBILE_HOTKEYS];
+  float opacity;
+  int direct_keys[NUM_MOBILE_DIRECT_HOTKEYS];
+  // v1.7: key glyph, function name, or both on the gameplay overlay.
+  int label_mode;
+  // v1.8: one shared, DPI-aware scale for every gameplay overlay key.
+  float key_scale;
+} mobile_hotkey_settings;
+
+typedef enum mobile_hotkey_label_mode {
+  MOBILE_HOTKEY_LABEL_KEY = 0,
+  MOBILE_HOTKEY_LABEL_FUNCTION = 1,
+  MOBILE_HOTKEY_LABEL_BOTH = 2
+} mobile_hotkey_label_mode;
+
+/* Settings added after v2.8 (OM, 2026-10-05). The file stays "2.8": this
+   block is found by its magic and carries its own size, so a file written
+   before a field existed reads back with that field at its default and
+   nothing before it is lost; a newer file read by an older build simply
+   has a longer tail the older build ignores.
+   RULE: every new persistent setting from now on is appended at the END of
+   this block (never in the middle, never elsewhere in user_settings) and
+   gets its default in user_settings_ext_default(). */
+#define USER_SETTINGS_EXT_MAGIC 0x54584557u /* "WEXT" */
+typedef struct user_settings_ext {
+  uint32_t magic;
+  uint32_t size; /* sizeof(user_settings_ext) of the build that wrote it */
+  bool spine[2];              /* normal, assist (OM, 2026-10-05) */
+  bool assist_hide_cosmetics; /* assist only (OM, 2026-10-05) */
+  /* Eyes Back key (OM, 2026-10-06), on-screen action 15. The floats come
+     first so they start at offset 12: byte 11 was padding in every file
+     written before, and must never be read as a setting. */
+  float eyes_back_x;
+  float eyes_back_y;
+  float eyes_back_scale;
+  float eyes_back_opacity;
+  bool eyes_back_visible;
+  /* Modes › Spine width (OM, 2026-10-09), normal and assist: a share of the
+     snake's width, 0 hides the spine, 1 is as wide as the snake (default
+     0.1, a thin line). Starts at offset 32: bytes 29-31 were padding in
+     every file written before. */
+  float spine_width[2];
+  /* Modes › Snake shadow (OM, 2026-10-09), normal and assist: the AIR
+     client's `ksmc_t` under every snake. */
+  bool snake_shadow[2];
+#ifdef WYRM_DESKTOP
+  /* Wyrm Desktop (OM, 2026-10-11): Eyes Back's key (action 15), default E.
+     Starts at offset 44: bytes 42-43 were padding in every file written
+     before. Desktop only, so the phone files keep their size. */
+  int32_t eyes_back_key;
+#endif
+#ifndef WYRM_DESKTOP
+  /* Bytes 42-43 were padding in every phone file written before: never read. */
+  uint8_t reserved_42[2];
+#endif
+  /* The arena, any address (OM, 2026-10-12): IPv6 does not fit the old `ipv4`
+     field. Phones: offset 44; Wyrm Desktop: 48 (after eyes_back_key). Read and
+     written only through user_settings_arena / user_settings_set_arena. */
+  char arena[MAX_ARENA_LEN + 1];
+  /* Wyrm skin (OM, 2026-10-13): a creature or strip look worn over the snake
+     (game/wyrm_skins.h), 0 for none. Phones: offset 108; Wyrm Desktop: 112.
+     Read through user_settings_wyrm_skin. */
+  int32_t wyrm_skin;
+  /* Snakey Rain key (OM, 2026-10-14), on-screen action 16: place, size
+     and opacity. Shown only while Rain is on, so no visible flag.
+     Phones: offset 112; Wyrm Desktop: 116. */
+  float rain_x;
+  float rain_y;
+  float rain_scale;
+  float rain_opacity;
+  /* On-screen key colours (OM, 2026-10-14), by action: one of the team
+     roster's nine colours, 0 = the theme. Phones: offset 128. */
+  int32_t key_colour[20];
+  /* A key's fill colour (OM, 2026-10-14); key_colour is its label and
+     border. Phones: offset 208. */
+  int32_t key_fill[20];
+  /* Spine on my snake only (OM, 2026-10-14), normal and assist; false =
+     every snake, as before. Phones: offset 288. */
+  bool spine_mine[2];
+  /* Skip the old tail padding; it must never be read as a setting. */
+  uint8_t reserved_white_alignment[2];
+  /* White keys migration; append only, never account-wide. */
+  bool keys_white_v1;
+  /* Skip padding written by 723/724; never interpret it as a flag. */
+  uint8_t reserved_grey_alignment[3];
+  bool keys_grey_fill_v1;
+  /* Boost glow on my snake only (OM, 2026-10-18), normal and assist;
+     false = every snake's, as before. Append only. */
+  bool boost_own[2];
+  /* Arrow sensitivity 0..1 (OM, 2026-10-18): 0 = the original 1x. Append
+     only. */
+  float arrow_sens;
+} user_settings_ext;
+
+typedef struct user_settings {
+  char version[4];
+  char nickname[MAX_NICKNAME_LEN + 1];
+  char ipv4[MAX_IPV4_LEN + 1];
+  char skin_code[MAX_SKIN_CODE_LEN + 1];
+  uint8_t accessory;
+  bool custom_skin;
+  uint8_t default_skin;
+  int score;
+  double play_time;
+  int kills;
+  font_size ui_font_size;
+  font_size lb_font_size;
+  font_size snake_names_font_size;
+  font_size stats_font_size;
+
+  // global settings:
+  vec3 bd_color;
+  vec4 laser_color;
+  int laser_thickness;
+  int cursor_size;
+  int minimap_size;
+  bool restart_rc;
+  bool quit_mc;
+  bool vsync;
+  bool smooth_zoom;
+  bool snake_scores;
+  /* Whether your own name is drawn over your own snake. Off by default — you
+     know what you called yourself — but in a crowd it is the fastest way to
+     find which snake is yours. */
+  bool show_own_name;
+
+  /* Tags — the bobble that hangs from the head on a rope. The names match what
+     the NTL mod calls them, because players arriving from it will go looking
+     for exactly these. */
+  int tag_index;   /* which tag you wear; -1 for none */
+  float tag_chain; /* rope length. 1 is the length the mod started with */
+  float tag_swing; /* how freely it swings; 1 is the mod's own feel */
+  float tag_scale; /* overall size, on top of each tag's own */
+  bool tags_small;
+  bool tags_hidden;    /* hide every tag, including your own */
+  bool tags_team_only; /* hide tags for snakes outside your team */
+
+  bool instant_restart;
+  float zoom_step;
+  int bot_radius_mult;
+  int bot_follow_circle_score;
+
+  gameplay_mode modes[2];
+  mobile_control_settings mobile_controls;
+
+  // hotkeys:
+  hotkey hotkeys[NUM_HOTKEYS];
+
+  // Appended in settings v1.5 so v1.4 saves can be migrated in place.
+  mobile_arrow_settings arrow_controls;
+
+  // Appended in settings v1.6. Positions are normalized to the Android safe
+  // area so a layout remains usable across resolutions and display cutouts.
+  mobile_hotkey_settings mobile_hotkeys;
+
+  /* Appended in settings v1.9, and reused rather than added to.
+     It was
+     briefly a death-screen delay; the delay stopped being a setting within the
+     hour, and this slot became the auto-respawn flag instead. Same four bytes,
+     same offset, so no save has to move for it. Non-zero means the snake comes
+     straight back and the card never appears. */
+  int auto_respawn;
+
+  /* Appended in settings v2.0. Rope mode itself is session state; only the
+
+   * draggable key's binding and layout belong in the durable settings file. */
+  int rope_mode_key;
+  bool rope_mode_visible;
+  float rope_mode_x;
+  float rope_mode_y;
+
+  /* Appended in settings v2.1. Kept outside `arrow_controls` so every field
+   * added after the v1.5 arrow block retains its old file offset. */
+  int arrow_style;
+
+  /* Appended in settings v2.2: one packed ARGB per position of `skin_code`.
+   *
+   * The wire only carries colour-group indices, so `skin_code` remains the
+   * whole of what an arena is told. This runs alongside it and is Wyrm's own
+   * decoration: the exact colour the player mixed, plus an alpha the protocol
+   * has no way to express. A zero entry means the position was not built with
+   * the picker and renders from the palette exactly as it always did. */
+  uint32_t skin_rgba[MAX_SKIN_CODE_LEN];
+
+  /* Appended in settings v2.3: which arena floor is drawn, as an index into
+     the background table. The table is only ever appended to, so an index
+     written by a newer build simply falls back on an older one. */
+  int arena_background;
+
+  /* Appended in settings v2.4: which client Wyrm last joined an arena as, as an
+     index into the persona table in `network/arena_persona.h`.
+     Only a match that outlived `SHORT_LIFE` writes here, so this is the last
+     identity that demonstrably worked rather than the last one tried. It is a
+     starting guess and never a constraint — the retry path stays free to
+     alternate, and `arena_persona_get` clamps an index it does not know. */
+  int arena_persona;
+
+  /* Appended in settings v2.5: seconds the arena stays on screen after death
+     before the lobby. 0 goes straight back. Max 4 s. Default 1.6 is original slither. */
+  float death_hold_s;
+
+  /* Appended in settings v2.6. The enable switch remains in each gameplay
+     mode; size and colour live at the tail so older user.dat layouts remain a
+     byte-for-byte prefix and can be migrated without moving any field. Values
+     are screen pixels, which lets the Compose preview show the exact diameter
+     the arena renderer will use. Index 0 is Normal, 1 is Assist. */
+  float head_dot_size[2];
+  vec3 head_dot_color[2];
+
+  /* Appended in settings v2.7. Screen-space HUD centres, normalized to the
+     current landscape viewport. World-space labels and gameplay controls do
+     not belong here; these five pairs only place the arena overlay. */
+  float hud_minimap_x;
+  float hud_minimap_y;
+  float hud_leaderboard_x;
+  float hud_leaderboard_y;
+  float hud_stats_x;
+  float hud_stats_y;
+  float hud_team_x;
+  float hud_team_y;
+  float hud_chat_x;
+  float hud_chat_y;
+
+  /* Appended in settings v2.8. Each editor object owns its appearance. The old
+     global values remain in place for file compatibility and seed migration. */
+  float joystick_opacity;
+  float boost_opacity;
+  float zoom_opacity;
+  float hotkey_scale[NUM_STORED_MOBILE_ACTIONS];
+  float hotkey_opacity[NUM_STORED_MOBILE_ACTIONS];
+  float hud_stats_scale;
+  float hud_stats_opacity;
+  float hud_chat_scale;
+  float hud_chat_opacity;
+
+  /* Appended after v2.8 without a version bump (OM, 2026-10-05). */
+  user_settings_ext ext;
+} user_settings;
+
+void user_settings_ext_default(user_settings_ext* ext);
+
+/* The arena to dial (OM, 2026-10-12): an IPv6 address from ext.arena, else
+   `ipv4`. Setting one writes ext.arena, and `ipv4` too when it is IPv4 (older
+   builds read that field). */
+const char* user_settings_arena(const user_settings* settings);
+/* The Wyrm skin worn, or 0 (an unknown number reads as none). */
+int user_settings_wyrm_skin(const user_settings* settings);
+void user_settings_set_arena(user_settings* settings, const char* address);
+/* True when a missing or damaged ext field was put back, so the caller saves. */
+bool user_settings_ext_fix(user_settings* settings, size_t bytes_read);
+/* A key's own size and opacity: actions 0-14 in the stored arrays, Eyes Back
+   (15) in the ext block. NULL for an action that has none. */
+float* user_settings_key_scale(user_settings* settings, int action);
+float* user_settings_key_opacity(user_settings* settings, int action);
+
+void user_settings_default(user_settings* usr_settings);
+void user_settings_reset_hud_layout(user_settings* usr_settings);
+void read_user_settings(user_settings* usr_settings);
+void save_user_settings(user_settings* usr_settings);
+
+#endif

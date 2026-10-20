@@ -1,0 +1,6 @@
+build/
+Generated/
+Vendor/
+dist/
+.DS_Store
+*.user

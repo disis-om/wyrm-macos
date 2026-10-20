@@ -1,0 +1,2037 @@
+#include "android_team.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#ifdef WYRM_SDL_JNI
+#include <jni.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_system.h>
+
+#include "../game/arena_theme.h"
+#include "../game/tags.h"
+#include "../game/ai_mode.h"
+#include "android_home.h"
+#include <math.h>
+#include <stdlib.h>
+#include "../user.h"
+
+/*
+ * Where the team is, held for exactly as long as it is true.
+ *
+ * The app polls the team service, parses it and hands the result down here as
+ * one flat string; the engine keeps the last one it was given and draws from
+ * it. Nothing here waits on a network, so a team service having a bad day
+ * costs the arena nothing at all.
+ */
+
+#define TEAM_MAX_MEMBERS 16
+
+typedef struct team_member {
+  char name[40];
+  int x;
+  int y;
+  int score;
+  int rank;
+  bool bot;
+  /* Whether they are in the same arena as this player. Only those can be
+     placed on the map — the coordinates of a snake in another arena mean
+     nothing here. */
+  bool present;
+  int sid;
+  /* Team HUD: the NTL key they play under and the arena they are in
+     (empty in the menu). */
+  char owner[40];
+  char server[160];
+} team_member;
+
+static tenv* team_env = NULL;
+static SDL_Mutex* team_mutex = NULL;
+static team_member members[TEAM_MAX_MEMBERS];
+static int member_count = 0;
+static team_member frame_members[TEAM_MAX_MEMBERS];
+static int frame_member_count = 0;
+
+/* Where this player is, written by the engine thread and read by the app's. */
+static char presence[256] = {0};
+static Uint64 presence_published_at = 0;
+static bool presence_was_playing = false;
+#define PRESENCE_PUBLISH_MS 250
+
+/*
+ * Chat, and the bot that covers for you while you read it.
+ *
+ * The panel itself is drawn by the app, not here — while it is open the bot is
+ * steering, so there is no gameplay touch left for it to take. All the engine
+ * owns is the button that opens it, the bot state, and the countdown that
+ * hands the snake back.
+ */
+static bool chat_open = false;
+static double release_at = 0.0;
+
+/*
+ * Chat asks for the bot, it does not take it.
+ *
+ * Reading chat with nobody steering is how you die reading chat, so the button
+ * refuses while the bot is off — and then has to say so, because a button that
+ * does nothing is worse than one that is not there. What it says depends on
+ * whether the player has a bot key of their own on the overlay: if they do,
+ * they are told to use it; if they do not, one is put underneath the chat
+ * button for them, because otherwise there is no way to turn the bot on at all.
+ */
+static Uint64 chat_hint_until = 0;
+static bool chat_hint_has_own_key = false;
+static bool bot_helper_shown = false;
+static float bot_helper[4] = {0, 0, 0, 0};
+#define CHAT_HINT_MS 5000
+static float chat_button[4] = {0, 0, 0, 0};
+
+/* Where the button hangs this frame, handed over by whoever drew the board it
+   sits beside. Earned again every frame: a board that stops being drawn stops
+   deciding where the button goes. */
+static float chat_anchor[2] = {0, 0};
+static bool chat_anchored = false;
+
+/* ------------------------------------------------------------- team HUD
+ *
+ * The roster and the chat window (OM, 2026-10-04). Both are drawn here, as the
+ * minimap is, so the layout editor shows exactly the same blocks over the AI
+ * arena, with placeholder rows that say what each place holds. Their look
+ * comes from the app (saved there and synced with the account); the chat's
+ * size and opacity are the engine's own `hud_chat_scale` / `hud_chat_opacity`.
+ */
+enum {
+  STYLE_TEAM_SCALE,
+  STYLE_TEAM_OPACITY,
+  STYLE_TEAM_WIDTH,
+  STYLE_TEAM_HEIGHT,
+  STYLE_TEAM_NAME,
+  STYLE_TEAM_DATA,
+  STYLE_CHAT_WIDTH,
+  STYLE_CHAT_HEIGHT,
+  STYLE_CHAT_NAME,
+  STYLE_CHAT_TEXT,
+  STYLE_TEAM_PANEL,
+  STYLE_CHAT_PANEL,
+  STYLE_STATS_PANEL, /* the stats panel's plate (OM, 2026-10-05) */
+  STYLE_STATS_TEXT,  /* the stats panel's text colour, 0 = theme (OM, 2026-10-11) */
+  STYLE_LB_WIDTH,    /* the leaderboard's width, x its own (OM, 2026-10-13) */
+  STYLE_LB_HEIGHT,   /* its row height, x its own; 1.75+ = two-line names */
+  STYLE_ONLINE_NAME, /* ONLINE tab names, 0 = theme (OM, 2026-10-14) */
+  STYLE_ONLINE_DATA, /* ONLINE tab "@username - server" line, 0 = theme */
+  STYLE_GLOBAL_NAME, /* GLOBAL tab names, 0 = theme (OM, 2026-10-18) */
+  STYLE_GLOBAL_TEXT, /* GLOBAL tab messages, 0 = theme */
+  STYLE_BTN_LABEL,   /* the folded chat button's label + border, 0 = white */
+  STYLE_BTN_FILL,    /* its fill: 0 theme card, 1-8 the palette, 9 grey */
+  STYLE_BTN_SCALE,   /* its size, x its own */
+  STYLE_BTN_OPACITY, /* its opacity */
+  STYLE_COUNT
+};
+static float hud_style[STYLE_COUNT] = {1.0f,   1.0f, 340.0f, 210.0f, 0.0f, 0.0f,
+                                       400.0f, 270.0f, 0.0f, 0.0f,   1.0f, 1.0f,
+                                       1.0f,   0.0f,   1.0f, 1.0f,
+                                       0.0f,   0.0f,
+                                       0.0f,   0.0f,   0.0f, 9.0f, 1.0f, 0.9f};
+
+#define TEAM_CHAT_MAX 80
+typedef struct team_chat_line {
+  char author[40];
+  char body[320];
+} team_chat_line;
+static team_chat_line chat_lines[TEAM_CHAT_MAX];
+static int chat_line_count = 0;
+static long chat_total = 0;
+static unsigned chat_revision = 0;
+static team_chat_line frame_chat[TEAM_CHAT_MAX];
+static int frame_chat_count = 0;
+static long frame_chat_total = 0;
+static unsigned frame_chat_revision = 0;
+static long seen_chat_total = -1;
+
+/* Chat tabs (OM, 2026-10-14): TEAM, GLOBAL (Wyrm's global chat, pushed by the
+   app) and ONLINE (players seen in the last minutes and their server). */
+enum { CHAT_TAB_TEAM, CHAT_TAB_GLOBAL, CHAT_TAB_ONLINE, CHAT_TAB_COUNT };
+static int chat_tab = CHAT_TAB_TEAM;
+static team_chat_line global_lines[TEAM_CHAT_MAX];
+static int global_line_count = 0;
+static long global_total = 0;
+static unsigned global_revision = 0;
+static team_chat_line frame_global[TEAM_CHAT_MAX];
+static int frame_global_count = 0;
+static long frame_global_total = 0;
+static unsigned frame_global_revision = 0;
+static long seen_global_total = -1;
+#define ONLINE_MAX 120
+typedef struct online_row {
+  char name[48];
+  char data[112];
+} online_row;
+static online_row online_rows[ONLINE_MAX];
+static int online_count = 0;
+static unsigned online_revision = 0;
+static online_row frame_online[ONLINE_MAX];
+static int frame_online_count = 0;
+static unsigned frame_online_revision = 0;
+static float chat_tab_rect[CHAT_TAB_COUNT][4];
+/* The X that folds the window, and how far down the ONLINE list is (0 = top). */
+static float chat_close_rect[4];
+static float online_scroll = 0.0f;
+
+static bool chat_expanded = true;
+/* 1 open, 0 the TEAM CHAT pill. A match moves this over 220 ms; the editor
+   stays open and does not touch the saved fold. */
+static float chat_openness = 1.0f;
+static Uint64 chat_fold_at = 0;
+static SDL_AtomicInt chat_toggle_pending;
+static float chat_fold_from = 1.0f;
+/* -1 grows from the full window's top-left, +1 from its top-right. Latched
+   for the whole animation so a resize cannot flip the corner halfway. */
+static int chat_fold_corner = 1;
+static float chat_full_cx = -1.0f;
+static float chat_scroll = 0.0f;   /* from the newest line up */
+static float roster_scroll = 0.0f; /* from the first row down */
+static float roster_rect[4] = {0, 0, 0, 0};
+static float chat_rect[4] = {0, 0, 0, 0};
+static float chat_header[4] = {0, 0, 0, 0};
+static float chat_input[4] = {0, 0, 0, 0};
+static int hud_touch_mode = 0; /* 0 none, 1 roster scroll, 2 chat scroll */
+static unsigned long long hud_touch_finger = 0;
+static float hud_touch_last_y = 0.0f;
+/* Bumped when the message box is tapped; the iOS shell takes it. */
+static SDL_AtomicInt composer_requests;
+
+static float hud_clamp(float value, float low, float high) {
+  if (!isfinite(value)) return low;
+  return value < low ? low : (value > high ? high : value);
+}
+
+static bool hud_inside(const float* rect, float x, float y) {
+  return rect[2] > 0.0f && x >= rect[0] && x <= rect[0] + rect[2] &&
+         y >= rect[1] && y <= rect[1] + rect[3];
+}
+
+/* One tab-separated field of a member row, or empty. */
+static void tab_field(const char* row, int index, char* out, size_t cap) {
+  out[0] = '\0';
+  const char* p = row;
+  for (int i = 0; i < index; ++i) {
+    p = strchr(p, '\t');
+    if (!p) return;
+    p++;
+  }
+  size_t n = strcspn(p, "\t\r\n");
+  if (n >= cap) n = cap - 1;
+  memcpy(out, p, n);
+  out[n] = '\0';
+}
+
+/* Palette for the editor's colour choices; 0 keeps the theme's colour. */
+static ImU32 hud_text_colour(int index, arena_theme_role fallback,
+                             float alpha) {
+  static const uint32_t palette[] = {0x000000, 0xFFFFFF, 0x111111,
+                                     0xFFD54A, 0x4DD9FF, 0x5BE37D,
+                                     0xFF6FB5, 0xFF9A3C, 0xFF5A5A};
+  if (index <= 0 || index >= (int)(sizeof(palette) / sizeof(palette[0])))
+    return arena_theme_colour(fallback, alpha);
+  uint32_t c = palette[index];
+  return igColorConvertFloat4ToU32((ImVec4){((c >> 16) & 255) / 255.0f,
+                                            ((c >> 8) & 255) / 255.0f,
+                                            (c & 255) / 255.0f, alpha});
+}
+
+/* The size slider asks for pixels that were never baked (faces load at 20,
+   24 and 28). Baking a new size on the locked atlas returns NULL and the
+   text draw divides by that. Warm the loaded size, then lock baked sizes for
+   this draw only so the closest face is scaled. Stats shares these fonts, so
+   the old flags go back on every exit. */
+static int hud_lock(ImFont* font) {
+  if (!font) return 0;
+  int old = font->Flags;
+  if ((old & ImFontFlags_LockBakedSizes) == 0) {
+    ImVec2 out;
+    ImFont_CalcTextSizeA(&out, font, font->LegacySize, 1e9f, 0.0f, " ", NULL,
+                         NULL);
+  }
+  font->Flags = old | ImFontFlags_LockBakedSizes;
+  return old;
+}
+
+static void hud_unlock(ImFont* font, int old) {
+  if (font) font->Flags = old;
+}
+
+static float hud_text_width(ImFont* font, float size, const char* text,
+                            const char* end) {
+  if (!font || !text) return 0.0f;
+  ImVec2 out;
+  ImFont_CalcTextSizeA(&out, font, size, 1e9f, 0.0f, text, end, NULL);
+  return out.x;
+}
+
+/* `text` cut to fit `width`, with "..." when it did not (whole UTF-8 letters
+   only). */
+static void hud_fit(ImFont* font, float size, const char* text, float width,
+                    char* out, size_t cap) {
+  snprintf(out, cap, "%s", text);
+  if (hud_text_width(font, size, out, NULL) <= width) return;
+  size_t n = strlen(out);
+  while (n > 0) {
+    n--;
+    while (n > 0 && ((unsigned char)out[n] & 0xC0) == 0x80) n--;
+    if (n + 4 > cap) continue;
+    memcpy(out + n, "...", 4);
+    if (hud_text_width(font, size, out, NULL) <= width) return;
+  }
+  out[0] = '\0';
+}
+
+/* Draws (or with no list, measures) `text` wrapped into `width`, its first
+   line starting `indent` in. Returns the height used. */
+static float hud_wrap(ImDrawList* draw, ImFont* font, float size, float x,
+                      float y, float width, float indent, const char* text,
+                      ImU32 colour) {
+  const char* s = text;
+  const char* end = text + strlen(text);
+  float line = size * 1.22f;
+  float cy = y;
+  bool first = true;
+  if (!font || s == end) return line;
+  int guard = 0;
+  while (s < end && guard < 48) {
+    guard++;
+    float avail = width - (first ? indent : 0.0f);
+    if (avail < size) avail = size;
+    const char* brk = ImFont_CalcWordWrapPosition(font, size, s, end, avail);
+    if (!brk || brk <= s) {
+      brk = s + 1;
+      while (brk < end && ((unsigned char)*brk & 0xC0) == 0x80) brk++;
+    }
+    if (draw)
+      ImDrawList_AddText_FontPtr(draw, font, size,
+                                 (ImVec2){x + (first ? indent : 0.0f), cy},
+                                 colour, s, brk, 0.0f, NULL);
+    cy += line;
+    first = false;
+    s = brk;
+    while (s < end && (*s == ' ' || *s == '\n')) s++;
+  }
+  return cy - y;
+}
+
+void android_team_set_hud_style(const float* values, int count) {
+  if (!values) return;
+  for (int i = 0; i < count && i < STYLE_COUNT; ++i)
+    if (isfinite(values[i])) hud_style[i] = values[i];
+}
+
+/* The stats panel's BACK (OM, 2026-10-05): how much of its white plate shows,
+   0..1; the text keeps its own OPACITY. Drawn by ui_overlay.c. */
+float android_team_stats_panel(void) {
+  return hud_clamp(hud_style[STYLE_STATS_PANEL], 0.0f, 1.0f);
+}
+
+/* The stats panel's text (OM, 2026-10-11): one of the nine colours the roster
+   and chat offer (0 keeps the theme's [role], as before), for the server line,
+   the labels and the values. */
+unsigned int android_team_stats_colour(int role, float alpha) {
+  return hud_text_colour((int)hud_style[STYLE_STATS_TEXT],
+                         (arena_theme_role)role, alpha);
+}
+
+/* The leaderboard's WIDTH and HEIGHT (OM, 2026-10-13), drawn by
+   ui_overlay.c: multiples of the board's own width and row height. */
+float android_team_lb_width(void) {
+  return hud_clamp(hud_style[STYLE_LB_WIDTH], 0.7f, 2.2f);
+}
+
+float android_team_lb_height(void) {
+  return hud_clamp(hud_style[STYLE_LB_HEIGHT], 1.0f, 2.2f);
+}
+
+void android_team_set_chat(const char* packed) {
+  if (!team_mutex || !packed) return;
+  SDL_LockMutex(team_mutex);
+  chat_line_count = 0;
+  chat_total = strtol(packed, NULL, 10);
+  const char* line = strchr(packed, '\n');
+  line = line ? line + 1 : "";
+  /* Keep the newest TEAM_CHAT_MAX: count first, then skip the oldest. */
+  int total_lines = 0;
+  for (const char* p = line; *p;) {
+    const char* e = strchr(p, '\n');
+    total_lines++;
+    if (!e) break;
+    p = e + 1;
+  }
+  int skip = total_lines > TEAM_CHAT_MAX ? total_lines - TEAM_CHAT_MAX : 0;
+  while (*line && chat_line_count < TEAM_CHAT_MAX) {
+    const char* end = strchr(line, '\n');
+    size_t length = end ? (size_t)(end - line) : strlen(line);
+    if (skip > 0) {
+      skip--;
+    } else {
+      const char* tab = memchr(line, '\t', length);
+      team_chat_line* out = chat_lines + chat_line_count;
+      size_t a = tab ? (size_t)(tab - line) : 0;
+      if (a >= sizeof(out->author)) a = sizeof(out->author) - 1;
+      memcpy(out->author, line, a);
+      out->author[a] = '\0';
+      const char* body = tab ? tab + 1 : line;
+      size_t b = length - (size_t)(body - line);
+      if (b >= sizeof(out->body)) b = sizeof(out->body) - 1;
+      memcpy(out->body, body, b);
+      out->body[b] = '\0';
+      chat_line_count++;
+    }
+    line = end ? end + 1 : "";
+  }
+  chat_revision++;
+  SDL_UnlockMutex(team_mutex);
+}
+
+/* Wyrm's global chat, packed as android_team_set_chat reads it: the total,
+   then one `author<TAB>body` line per message, oldest first. */
+void android_team_set_global_chat(const char* packed) {
+  if (!team_mutex || !packed) return;
+  SDL_LockMutex(team_mutex);
+  global_line_count = 0;
+  global_total = strtol(packed, NULL, 10);
+  const char* line = strchr(packed, '\n');
+  line = line ? line + 1 : "";
+  int total_lines = 0;
+  for (const char* p = line; *p;) {
+    const char* e = strchr(p, '\n');
+    total_lines++;
+    if (!e) break;
+    p = e + 1;
+  }
+  int skip = total_lines > TEAM_CHAT_MAX ? total_lines - TEAM_CHAT_MAX : 0;
+  while (*line && global_line_count < TEAM_CHAT_MAX) {
+    const char* end = strchr(line, '\n');
+    size_t length = end ? (size_t)(end - line) : strlen(line);
+    if (skip > 0) {
+      skip--;
+    } else {
+      const char* tab = memchr(line, '\t', length);
+      team_chat_line* out = global_lines + global_line_count;
+      size_t a = tab ? (size_t)(tab - line) : 0;
+      if (a >= sizeof(out->author)) a = sizeof(out->author) - 1;
+      memcpy(out->author, line, a);
+      out->author[a] = '\0';
+      const char* body = tab ? tab + 1 : line;
+      size_t b = length - (size_t)(body - line);
+      if (b >= sizeof(out->body)) b = sizeof(out->body) - 1;
+      memcpy(out->body, body, b);
+      out->body[b] = '\0';
+      global_line_count++;
+    }
+    line = end ? end + 1 : "";
+  }
+  global_revision++;
+  SDL_UnlockMutex(team_mutex);
+}
+
+/* Players online: one `name<TAB>data` line each (data = "@username - server"). */
+void android_team_set_online(const char* packed) {
+  if (!team_mutex || !packed) return;
+  SDL_LockMutex(team_mutex);
+  online_count = 0;
+  const char* line = packed;
+  while (*line && online_count < ONLINE_MAX) {
+    const char* end = strchr(line, '\n');
+    size_t length = end ? (size_t)(end - line) : strlen(line);
+    if (length > 0) {
+      const char* tab = memchr(line, '\t', length);
+      online_row* out = online_rows + online_count;
+      size_t a = tab ? (size_t)(tab - line) : length;
+      if (a >= sizeof(out->name)) a = sizeof(out->name) - 1;
+      memcpy(out->name, line, a);
+      out->name[a] = '\0';
+      out->data[0] = '\0';
+      if (tab) {
+        size_t b = length - (size_t)(tab + 1 - line);
+        if (b >= sizeof(out->data)) b = sizeof(out->data) - 1;
+        memcpy(out->data, tab + 1, b);
+        out->data[b] = '\0';
+      }
+      online_count++;
+    }
+    line = end ? end + 1 : "";
+  }
+  online_revision++;
+  SDL_UnlockMutex(team_mutex);
+}
+
+/* Which tab the window shows: where the message box sends (0 team, 1 global,
+   2 online). The app sets it to preview the ONLINE colours in the editor. */
+int android_team_chat_tab(void) { return chat_tab; }
+/* The editor's Button tab (OM, 2026-10-18): tab 3 shows the folded chat
+   button instead of the window while the editor is up. */
+static bool chat_button_preview = false;
+void android_team_set_chat_tab(int tab) {
+  chat_button_preview = tab == 3;
+  if (tab >= 0 && tab < CHAT_TAB_COUNT && tab != chat_tab) {
+    chat_tab = tab;
+    chat_scroll = 0.0f;
+    online_scroll = 0.0f;
+  }
+}
+
+static void snapshot_chat(void) {
+  if (!team_mutex) return;
+  SDL_LockMutex(team_mutex);
+  if (chat_revision != frame_chat_revision) {
+    frame_chat_revision = chat_revision;
+    frame_chat_count = chat_line_count;
+    frame_chat_total = chat_total;
+    memcpy(frame_chat, chat_lines,
+           sizeof(team_chat_line) * (size_t)chat_line_count);
+  }
+  if (global_revision != frame_global_revision) {
+    frame_global_revision = global_revision;
+    frame_global_count = global_line_count;
+    frame_global_total = global_total;
+    memcpy(frame_global, global_lines,
+           sizeof(team_chat_line) * (size_t)global_line_count);
+  }
+  if (online_revision != frame_online_revision) {
+    frame_online_revision = online_revision;
+    frame_online_count = online_count;
+    memcpy(frame_online, online_rows, sizeof(online_row) * (size_t)online_count);
+  }
+  SDL_UnlockMutex(team_mutex);
+}
+
+/* The editor shows the blocks with placeholder rows. Not in the background
+   size editor (map and board only). Near Original still shows them: the
+   roster and the chat stay movable there. */
+static bool hud_preview(void) {
+  return ai_mode_is_editor() && !ai_mode_editor_bare();
+}
+
+static void hud_card(ImDrawList* draw, ImVec2 min, ImVec2 max, float radius,
+                     float opacity) {
+  ImDrawList_AddRectFilled(
+      draw, (ImVec2){min.x, min.y + 3}, (ImVec2){max.x, max.y + 3},
+      igColorConvertFloat4ToU32((ImVec4){0, 0, 0, 0.26f * opacity}), radius, 0);
+  ImDrawList_AddRectFilled(draw, min, max,
+                           arena_theme_colour(ARENA_THEME_CARD, 0.94f * opacity),
+                           radius, 0);
+  ImDrawList_AddRect(draw, min, max,
+                     arena_theme_colour(ARENA_THEME_RULE, opacity), radius, 0,
+                     1.0f);
+}
+
+/* Keeps a block of this size whole on screen, 16 px in from every edge. */
+static void hud_place(tenv* env, float centre_x, float centre_y, float width,
+                      float height, float* left, float* top) {
+  *left = centre_x - width * 0.5f;
+  *top = centre_y - height * 0.5f;
+  float w = env->ctx->size[0], h = env->ctx->size[1];
+  if (*left + width > w - 16.0f) *left = w - 16.0f - width;
+  if (*top + height > h - 16.0f) *top = h - 16.0f - height;
+  if (*left < 16.0f) *left = 16.0f;
+  if (*top < 16.0f) *top = 16.0f;
+}
+
+static float chat_fold_smooth(float t) {
+  if (t <= 0.0f) return 0.0f;
+  if (t >= 1.0f) return 1.0f;
+  return t * t * (3.0f - 2.0f * t);
+}
+
+/* Samples the fold. Toggling again mid-way reverses from wherever it is. */
+static float chat_fold_sample(void) {
+  if (!chat_fold_at) {
+    chat_openness = chat_expanded ? 1.0f : 0.0f;
+    return chat_openness;
+  }
+  float t = (float)(SDL_GetTicks() - chat_fold_at) / 220.0f;
+  float target = chat_expanded ? 1.0f : 0.0f;
+  if (t >= 1.0f) {
+    chat_fold_at = 0;
+    chat_openness = target;
+    return target;
+  }
+  chat_openness =
+      chat_fold_from + (target - chat_fold_from) * chat_fold_smooth(t);
+  return chat_openness;
+}
+
+static void chat_toggle_fold(float screen_w) {
+  /* Already moving: keep the corner. Otherwise decide from the full window. */
+  if (!chat_fold_at && chat_full_cx >= 0.0f && screen_w > 0.0f)
+    chat_fold_corner = (chat_full_cx < screen_w * 0.5f) ? -1 : 1;
+  float now = chat_fold_at ? chat_openness : (chat_expanded ? 1.0f : 0.0f);
+  chat_expanded = !chat_expanded;
+  chat_fold_from = now;
+  chat_openness = now;
+  chat_fold_at = SDL_GetTicks();
+  if (!chat_fold_at) chat_fold_at = 1;
+  chat_scroll = 0.0f;
+}
+
+void android_team_bind_env(tenv* env) {
+  team_env = env;
+  if (!team_mutex) team_mutex = SDL_CreateMutex();
+}
+
+void android_team_poll(tenv* env) {
+  if (!env || !team_mutex) return;
+  tuser_data* usr = env->usr;
+  game_data* game = &usr->gdata;
+
+  bool playing = game->conn == CONNECTED && game->curr_screen == PLAYING;
+  Uint64 now = SDL_GetTicks();
+  if (presence_published_at && playing == presence_was_playing &&
+      now - presence_published_at < PRESENCE_PUBLISH_MS)
+    return;
+  presence_published_at = now;
+  presence_was_playing = playing;
+
+  int x = 0;
+  int y = 0;
+  /* NTL's id for our snake (packet S), which is what the mod publishes as
+     `sid` and looks a tag up by. The raw arena id put our tag on nobody. */
+  int sid = 0;
+  if (playing) {
+    int length = tdarray_length(game->data.snakes);
+    if (length > 0) {
+      snake* me = game->data.snakes + (length - 1);
+      if (game->data.snake_id == me->id) {
+        x = (int)(me->xx + me->fx);
+        y = (int)(me->yy + me->fy);
+        sid = me->ntl_id;
+      }
+    }
+  }
+
+  /*
+   * The tag goes out too, in the mod's own numbering.
+   *
+   * This is how a player using the NTL extension sees what a Wyrm player is
+   * wearing: the service carries it and hands it to everyone on the network.
+   * Read off the mod's own report, which sends `tg` beside the rest of this and
+   * `sid` as the snake's id — the protocol note used to call `sid` "always 0,
+   * never populated, unknown", and it is neither of those things.
+   *
+   * `-1` is no tag, which is what the mod sends when the player has none.
+   */
+  int tag = tags_ntl_id(usr->usrs.tag_index);
+
+  char line[sizeof(presence)];
+  snprintf(line, sizeof(line), "%s\t%d\t%d\t%d\t%d\t%s\t%d\t%d\t%d",
+           usr->usrs.nickname, playing ? game->data.score : 0, x, y,
+           playing && usr->usrs.hotkeys[HOTKEY_BOT].active ? 1 : 0,
+           playing ? user_settings_arena(&usr->usrs) : "_GAME_MENU_",
+           playing ? game->data.rank : 0, sid, tag);
+
+  SDL_LockMutex(team_mutex);
+  memcpy(presence, line, sizeof(presence));
+  SDL_UnlockMutex(team_mutex);
+}
+
+static int snapshot(team_member* out) {
+  if (!team_mutex) return 0;
+  SDL_LockMutex(team_mutex);
+  int count = member_count;
+  memcpy(out, members, sizeof(team_member) * (size_t)count);
+  SDL_UnlockMutex(team_mutex);
+  return count;
+}
+
+void android_team_begin_frame(void) {
+  frame_member_count = snapshot(frame_members);
+  snapshot_chat();
+}
+
+static ImU32 team_colour(float r, float g, float b, float a) {
+  return igColorConvertFloat4ToU32((ImVec4){r, g, b, a});
+}
+
+/* You are on your own team's list. Your place is your arrow, not a second
+   dot on top of it (OM, 2026-10-06): the same in-game name, ignoring case
+   and spaces at the ends, is you. */
+static bool team_member_is_me(tenv* env, const team_member* member) {
+  game_data* game = &env->usr->gdata;
+  int count = tdarray_length(game->data.snakes);
+  for (int i = 0; i < count; ++i) {
+    const snake* me = game->data.snakes + i;
+    if (me->id == game->data.snake_id)
+      return member->sid > 0 && member->sid == me->ntl_id;
+  }
+  return false;
+}
+
+/* Is this teammate in the arena this player is in, right now?
+ *
+ * The app decides `present` when its poll goes out, from where the engine was
+ * at that moment. A poll taken while this player was dead or between lives
+ * said "menu", so every teammate fell off the map for a whole poll (4 s) after
+ * each respawn; iOS also wanted a non-zero NTL snake id, which a Wyrm player
+ * without packet S never has. The member's arena travels with the row (field
+ * 10), so the map compares it with the arena being played, every frame. Same
+ * address written two ways ("ws://", "/slither", case, spaces) is the same
+ * arena. (OM, 2026-10-09: teammates came and went on the minimap.) */
+/* Canonical endpoint: NTL sends host:port, apps may send a websocket URL.
+   Keep the port, ignore URL decoration and IPv6 brackets. Never resolve DNS. */
+static size_t arena_key(const char* in, char* out, size_t cap) {
+  if (!out || cap == 0) return 0;
+  out[0] = '\0';
+  if (!in) return 0;
+  while (*in == ' ' || *in == '\t') ++in;
+  const char* scheme = strstr(in, "://");
+  if (scheme) in = scheme + 3;
+  char host[160];
+  size_t n = 0;
+  for (; *in && *in != '/' && *in != '?' && *in != '#'; ++in) {
+    unsigned char c = (unsigned char)*in;
+    if (c <= ' ') continue;
+    if (n + 1 >= sizeof(host)) return 0;
+    host[n++] = c >= 'A' && c <= 'Z' ? (char)(c + 'a' - 'A') : (char)c;
+  }
+  host[n] = '\0';
+  if (!n || strcmp(host, "_game_menu_") == 0) return 0;
+  char* address = host;
+  char* port = NULL;
+  if (host[0] == '[') {
+    char* close = strchr(host, ']');
+    if (!close || (close[1] && close[1] != ':')) return 0;
+    if (close[1] == ':') port = close + 2;
+    *close = '\0';
+    address++;
+  } else {
+    char* first = strchr(host, ':');
+    if (first && !strchr(first + 1, ':')) { *first = '\0'; port = first + 1; }
+  }
+  unsigned long number = 444;
+  if (port) {
+    if (!*port) return 0;
+    number = 0;
+    for (const char* p = port; *p; ++p) {
+      if (*p < '0' || *p > '9') return 0;
+      number = number * 10 + (unsigned)(*p - '0');
+      if (number > 65535) return 0;
+    }
+    if (!number) return 0;
+  }
+  if (!*address) return 0;
+  /* Expand hex IPv6 so compressed and full spellings compare alike. */
+  char expanded[80];
+  if (strchr(address, ':')) {
+    unsigned words[8] = {0};
+    int count = 0, gap = -1;
+    const char* p = address;
+    if (*p == ':') { if (p[1] != ':') return 0; gap = 0; p += 2; }
+    while (*p) {
+      if (count >= 8) return 0;
+      unsigned value = 0; int digits = 0;
+      while (*p && *p != ':') {
+        int d = *p >= '0' && *p <= '9' ? *p - '0' : (*p >= 'a' && *p <= 'f' ? *p - 'a' + 10 : -1);
+        if (d < 0 || ++digits > 4) return 0;
+        value = value * 16 + (unsigned)d; ++p;
+      }
+      if (!digits) return 0;
+      words[count++] = value;
+      if (*p) { ++p; if (*p == ':') { if (gap >= 0) return 0; gap = count; ++p; } else if (!*p) return 0; }
+    }
+    if (gap >= 0) {
+      if (count >= 8) return 0;
+      int zeros = 8 - count;
+      for (int i = count - 1; i >= gap; --i) words[i + zeros] = words[i];
+      for (int i = gap; i < gap + zeros; ++i) words[i] = 0;
+    } else if (count != 8) return 0;
+    snprintf(expanded, sizeof(expanded), "%x:%x:%x:%x:%x:%x:%x:%x", words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    address = expanded;
+  }
+  int written = snprintf(out, cap, "%s:%lu", address, number);
+  if (written < 0 || (size_t)written >= cap) { out[0] = '\0'; return 0; }
+  return (size_t)written;
+}
+
+static bool team_member_here(tenv* env, const team_member* member) {
+  if (!member->server[0]) return member->present;
+  char a[192], b[192];
+  if (!arena_key(member->server, a, sizeof(a))) return false;
+  if (!arena_key(user_settings_arena(&env->usr->usrs), b, sizeof(b))) return false;
+  if (strcmp(a, b) == 0) return true;
+  /* The reference client reports IPv6 as bso.ip + ":" + bso.po, without
+     brackets. Only the NTL member side needs this legacy endpoint spelling. */
+  const char* raw = member->server;
+  const char* last = strrchr(raw, ':');
+  if (raw[0] != '[' && !strstr(raw, "://") && last && strchr(raw, ':') != last) {
+    char endpoint[192];
+    int n = snprintf(endpoint, sizeof(endpoint), "[%.*s]:%s", (int)(last - raw), raw, last + 1);
+    if (n > 0 && (size_t)n < sizeof(endpoint) && arena_key(endpoint, a, sizeof(a)))
+      return strcmp(a, b) == 0;
+  }
+  return false;
+}
+
+bool android_team_is_teammate(tenv* env, int sid, const char* name) {
+  if (!env) return false;
+  for (int i = 0; i < frame_member_count; ++i) {
+    const team_member* member = frame_members + i;
+    if (!team_member_here(env, member)) continue;
+    if (sid > 0 && member->sid > 0) {
+      if (sid == member->sid) return true;
+    } else if (name && name[0] && strcmp(name, member->name) == 0) return true;
+  }
+  return false;
+}
+
+void android_team_draw_minimap(tenv* env, float left, float top,
+                               float diameter) {
+  int count = frame_member_count;
+  if (count <= 0 || diameter <= 0.0f) return;
+
+  game_data* game = &env->usr->gdata;
+  float world_radius = game->data.flux_grd;
+  if (world_radius <= 1.0f) return;
+
+  float centre_x = left + diameter * 0.5f;
+  float centre_y = top + diameter * 0.5f;
+  float radius = diameter * 0.026f;
+  if (radius < 4.0f) radius = 4.0f;
+  if (radius > 7.0f) radius = 7.0f;
+
+  ImDrawList* draw = igGetForegroundDrawList_ViewportPtr(NULL);
+  for (int i = 0; i < count; ++i) {
+    if (!team_member_here(env, frame_members + i)) continue;
+    if (frame_members[i].x == 0 && frame_members[i].y == 0) continue;
+    if (team_member_is_me(env, frame_members + i)) continue;
+
+    float nx = (frame_members[i].x - game->data.grd) / world_radius;
+    float ny = (frame_members[i].y - game->data.grd) / world_radius;
+    if (nx < -1.0f || nx > 1.0f || ny < -1.0f || ny > 1.0f) continue;
+
+    ImVec2 point = {centre_x + nx * diameter * 0.40f,
+                    centre_y + ny * diameter * 0.40f};
+    /* A dark ring under the mark so it survives a pale patch of map, then
+       Wyrm's green — the one colour the interface reserves for something that
+       is alive right now. */
+    ImDrawList_AddCircleFilled(draw, point, radius + 2.0f,
+                               team_colour(0, 0, 0, 0.70f), 20);
+    ImDrawList_AddCircleFilled(draw, point, radius,
+                               arena_theme_colour(ARENA_THEME_LIVE, 1.0f), 20);
+  }
+}
+
+float android_team_draw_roster_centered(tenv* env, float centre_x,
+                                        float centre_y) {
+  /* The roster (OM, 2026-10-04): each teammate's in-game name and score in
+     bold, under it the NTL key they play under and the arena they are in.
+     Its own scroll when the team is longer than the block. In the layout
+     editor it shows placeholder rows that say what each place holds. */
+  roster_rect[2] = 0.0f;
+  roster_rect[3] = 0.0f;
+  if (!env) return 0.0f;
+  bool preview = hud_preview();
+  int count = preview ? 3 : frame_member_count;
+  if (count <= 0) return 0.0f;
+
+  tuser_data* usr = env->usr;
+  float scale = hud_clamp(hud_style[STYLE_TEAM_SCALE], 0.65f, 1.60f);
+  float opacity = hud_clamp(hud_style[STYLE_TEAM_OPACITY], 0.05f, 1.0f);
+  float panel = hud_clamp(hud_style[STYLE_TEAM_PANEL], 0.0f, 1.0f);
+  float width = hud_clamp(hud_style[STYLE_TEAM_WIDTH], 220.0f, 900.0f) * scale;
+  float height = hud_clamp(hud_style[STYLE_TEAM_HEIGHT], 120.0f, 800.0f) * scale;
+  int name_colour = (int)hud_style[STYLE_TEAM_NAME];
+  int data_colour = (int)hud_style[STYLE_TEAM_DATA];
+  /* Bold for names and scores: the body face's default instance is too
+     light to read over the arena (OM, 2026-10-04). */
+  ImFont* bold = usr->imgui_data.regular_font_bold[FONT_SIZE_SMALL];
+  ImFont* regular = usr->imgui_data.regular_font[FONT_SIZE_SMALL];
+  if (!bold || !regular) return 0.0f;
+  int bold_flags = hud_lock(bold);
+  int regular_flags = hud_lock(regular);
+  float name_size = bold->LegacySize * scale;
+  float data_size = regular->LegacySize * 0.86f * scale;
+  float pad = 12.0f * scale;
+  ImDrawList* draw = igGetForegroundDrawList_ViewportPtr(NULL);
+
+  float left, top;
+  hud_place(env, centre_x, centre_y, width, height, &left, &top);
+  ImVec2 min = {left, top};
+  ImVec2 max = {left + width, top + height};
+  hud_card(draw, min, max, 14.0f * scale, panel * opacity);
+
+  char title[24];
+  snprintf(title, sizeof(title), "TEAM  %d", count);
+  ImDrawList_AddText_FontPtr(draw, bold, data_size,
+                             (ImVec2){min.x + pad, min.y + pad * 0.7f},
+                             arena_theme_colour(ARENA_THEME_QUIET, opacity),
+                             title, NULL, 0.0f, NULL);
+  float rule_y = min.y + pad * 0.7f + data_size + 6.0f * scale;
+  ImDrawList_AddLine(draw, (ImVec2){min.x + pad, rule_y},
+                     (ImVec2){max.x - pad, rule_y},
+                     arena_theme_colour(ARENA_THEME_RULE, 0.8f * opacity),
+                     1.0f);
+
+  float list_top = rule_y + 4.0f * scale;
+  float list_bottom = max.y - pad * 0.6f;
+  float list_height = list_bottom - list_top;
+  float row_height = name_size + data_size + 12.0f * scale;
+  float content = row_height * count;
+  float most = content > list_height ? content - list_height : 0.0f;
+  roster_scroll = hud_clamp(roster_scroll, 0.0f, most);
+
+  ImDrawList_PushClipRect(draw, (ImVec2){min.x, list_top},
+                          (ImVec2){max.x, list_bottom}, true);
+  float text_left = min.x + pad + 14.0f * scale;
+  float text_right = max.x - pad - (most > 0.0f ? 6.0f * scale : 0.0f);
+  for (int i = 0; i < count; ++i) {
+    float y = list_top + row_height * i - roster_scroll;
+    if (y + row_height < list_top || y > list_bottom) continue;
+    const char* name = preview ? "Player name" : frame_members[i].name;
+    const char* owner = preview ? "Key name" : frame_members[i].owner;
+    const char* server = preview ? "IP address" : frame_members[i].server;
+    bool present = preview ? true : team_member_here(env, frame_members + i);
+    char score_text[16];
+    if (preview)
+      snprintf(score_text, sizeof(score_text), "Score");
+    else
+      snprintf(score_text, sizeof(score_text), "%d", frame_members[i].score);
+    if (!preview && !server[0]) server = "In the menu";
+    if (!preview && !owner[0]) owner = "-";
+    float alpha = (present ? 1.0f : 0.62f) * opacity;
+
+    ImDrawList_AddCircleFilled(
+        draw, (ImVec2){min.x + pad + 4.0f * scale, y + name_size * 0.55f},
+        3.5f * scale,
+        present ? arena_theme_colour(ARENA_THEME_LIVE, opacity)
+                : arena_theme_colour(ARENA_THEME_MUTE, 0.6f * opacity),
+        14);
+
+    float score_w = hud_text_width(bold, name_size, score_text, NULL);
+    char fitted[96];
+    hud_fit(bold, name_size, name,
+            text_right - text_left - score_w - 10.0f * scale, fitted,
+            sizeof(fitted));
+    ImDrawList_AddText_FontPtr(
+        draw, bold, name_size, (ImVec2){text_left, y},
+        hud_text_colour(name_colour, ARENA_THEME_INK, alpha), fitted, NULL,
+        0.0f, NULL);
+    ImDrawList_AddText_FontPtr(
+        draw, bold, name_size, (ImVec2){text_right - score_w, y},
+        hud_text_colour(name_colour, ARENA_THEME_INK, alpha), score_text,
+        NULL, 0.0f, NULL);
+
+    float data_y = y + name_size + 3.0f * scale;
+    float half = (text_right - text_left) * 0.5f - 6.0f * scale;
+    hud_fit(regular, data_size, owner, half, fitted, sizeof(fitted));
+    ImDrawList_AddText_FontPtr(
+        draw, regular, data_size, (ImVec2){text_left, data_y},
+        hud_text_colour(data_colour, ARENA_THEME_QUIET, alpha), fitted, NULL,
+        0.0f, NULL);
+    hud_fit(regular, data_size, server, half, fitted, sizeof(fitted));
+    float server_w = hud_text_width(regular, data_size, fitted, NULL);
+    ImDrawList_AddText_FontPtr(
+        draw, regular, data_size, (ImVec2){text_right - server_w, data_y},
+        hud_text_colour(data_colour, ARENA_THEME_QUIET, alpha), fitted, NULL,
+        0.0f, NULL);
+  }
+  ImDrawList_PopClipRect(draw);
+
+  /* A thin bar says there is more, and where in the list you are. */
+  if (most > 0.0f) {
+    float bar = list_height * list_height / content;
+    float bar_y = list_top + (list_height - bar) * (roster_scroll / most);
+    ImDrawList_AddRectFilled(draw, (ImVec2){max.x - pad * 0.5f - 2.0f, bar_y},
+                             (ImVec2){max.x - pad * 0.5f + 1.0f, bar_y + bar},
+                             arena_theme_colour(ARENA_THEME_QUIET, 0.6f * opacity),
+                             2.0f, 0);
+  }
+
+  roster_rect[0] = left;
+  roster_rect[1] = top;
+  roster_rect[2] = width;
+  roster_rect[3] = height;
+  hud_unlock(bold, bold_flags);
+  hud_unlock(regular, regular_flags);
+  return height;
+}
+
+/* -------------------------------------------------------------- chat + bot */
+
+/**
+ * Tells Compose the panel is up or down.
+ *
+ * Both directions go through here now. Only the opening did before, and the
+ * closing was left to Compose noticing on its own — which it does when the
+ * player closes the panel, and does not when the engine lets go of chat
+ * underneath it. See `android_team_release_chat`.
+ */
+static void notify_java_chat(bool shown) {
+  JNIEnv* jni = (JNIEnv*)SDL_GetAndroidJNIEnv();
+  if (!jni) return;
+  jclass activity = (*jni)->FindClass(jni, "com/wyrm/omrajput/WyrmActivity");
+  if (!activity) {
+    (*jni)->ExceptionClear(jni);
+    return;
+  }
+  jmethodID method = (*jni)->GetStaticMethodID(jni, activity,
+                                               "setTeamChatFromNative", "(Z)V");
+  if (method)
+    (*jni)->CallStaticVoidMethod(jni, activity, method,
+                                 shown ? JNI_TRUE : JNI_FALSE);
+  if ((*jni)->ExceptionCheck(jni)) (*jni)->ExceptionClear(jni);
+  (*jni)->DeleteLocalRef(jni, activity);
+}
+
+/*
+ * Chat no longer touches the bot, and that is the point.
+ *
+ * It used to force it on for as long as the panel was open and hand it back
+ * afterwards, which is a reasonable idea and was the source of a run of bugs:
+ * the hold outlived the panel, the death card captured the forced value as the
+ * player's own preference, and a player who had never bound a bot key had no
+ * way to undo any of it. Every one of those is the same mistake — the app
+ * deciding something on the player's behalf and then having to remember to
+ * undo it.
+ *
+ * So the bot is the player's, always. Chat asks whether it is on and refuses to
+ * open if it is not, because reading chat with nobody steering is how you die
+ * reading chat. `chat_button_hit` is where that is said out loud.
+ */
+static void open_chat(tenv* env) {
+  (void)env;
+  chat_open = true;
+  release_at = 0.0;
+  SDL_AddAtomicInt(&composer_requests, 1);
+  notify_java_chat(true);
+}
+
+void android_team_close_chat(float seconds) {
+  /* The seconds were a countdown before handing the snake back. Nothing is
+     held any more, so there is nothing to hand back and nothing to count. */
+  (void)seconds;
+  chat_open = false;
+  release_at = 0.0;
+}
+
+bool android_team_chat_open(void) { return chat_open; }
+
+void android_team_release_chat(tenv* env) {
+  bool was_open = chat_open;
+  (void)env;
+  chat_open = false;
+  release_at = 0.0;
+
+  /*
+   * Compose has to be told, and this is where dying with chat open went wrong.
+   *
+   * Chat opening moves Compose to `Route.ARENA_CHAT` and remembers where it
+   * came from. Dying calls this, which used to clear the engine's flags and
+   * say nothing — so Compose stayed on the chat route while the engine went
+   * back to thinking chat was closed. Then the death card came up and, on
+   * Play, hid the whole interface with that route still latched. From there:
+   * the surface never got its focus back, so nothing steered; the engine drew
+   * its CHAT button but Compose's stale route swallowed the screen; and
+   * opening chat again set `chatReturn` to the chat route itself, after which
+   * closing chat returned to chat and the bot it holds could never be let go.
+   *
+   * Only on a real transition — this is also called every frame while out of a
+   * match, and JNI on every one of those would be a poor idea.
+   */
+  if (was_open) notify_java_chat(false);
+}
+
+void android_team_tick(tenv* env) {
+  if (!env) return;
+  game_data* game = &env->usr->gdata;
+
+  /* Leaving the arena closes chat, and that is all there is left to do here —
+     the bot hold and its "TAKE THE SNAKE" countdown are gone with it. */
+  if (game->curr_screen != PLAYING || game->conn != CONNECTED)
+    android_team_release_chat(env);
+}
+
+void android_team_set_chat_centre(float centre_x, float centre_y) {
+  chat_anchor[0] = centre_x;
+  chat_anchor[1] = centre_y;
+  chat_anchored = true;
+}
+
+/* Row i of the shown tab (the editor's placeholder rows when previewing). */
+static void chat_row(int i, bool preview, const char** author, const char** body) {
+  static const char* chat_sample[][2] = {{"Player name", "Message"},
+                                         {"Player name", "Message"},
+                                         {"Key name", "Message"},
+                                         {"Player name", "Message"}};
+  static const char* online_sample[][2] = {{"In-game name", "@username - Server"},
+                                           {"In-game name", "@username - Server"},
+                                           {"In-game name", "@username - Server"},
+                                           {"In-game name", "@username - Server"}};
+  if (preview) {
+    const char* (*s)[2] = chat_tab == CHAT_TAB_ONLINE ? online_sample : chat_sample;
+    *author = s[i][0];
+    *body = s[i][1];
+    return;
+  }
+  if (chat_tab == CHAT_TAB_ONLINE) {
+    *author = frame_online[i].name;
+    *body = frame_online[i].data;
+    return;
+  }
+  const team_chat_line* src = chat_tab == CHAT_TAB_GLOBAL ? frame_global : frame_chat;
+  *author = src[i].author;
+  *body = src[i].body;
+}
+
+void android_team_draw_chat_button(tenv* env) {
+  /* The chat window (OM, 2026-10-04): the team chat, the same messages the
+     app's Team page shows, open or folded to a pill, played through while
+     open. Tap the header to fold it, the message box to write. */
+  if (env && (SDL_SetAtomicInt(&chat_toggle_pending, 0) & 1))
+    chat_toggle_fold(env->ctx->size[0]);
+  bool anchored = chat_anchored;
+  chat_anchored = false;
+  chat_rect[2] = 0.0f;
+  chat_header[2] = 0.0f;
+  chat_input[2] = 0.0f;
+  chat_button[2] = 0.0f;
+  chat_button[3] = 0.0f;
+  memset(chat_tab_rect, 0, sizeof(chat_tab_rect));
+  memset(chat_close_rect, 0, sizeof(chat_close_rect));
+  if (!env || ai_mode_editor_bare()) return;
+  bool preview = hud_preview();
+  if (!preview) {
+    if (env->usr->gdata.curr_screen != PLAYING ||
+        env->usr->gdata.conn != CONNECTED)
+      return;
+    /* Every online match (OM, 2026-10-14): GLOBAL and ONLINE need no team. */
+  }
+
+  tuser_data* usr = env->usr;
+  float scale = hud_clamp(usr->usrs.hud_chat_scale, 0.65f, 1.60f);
+  float opacity = hud_clamp(usr->usrs.hud_chat_opacity, 0.05f, 1.0f);
+  float panel = hud_clamp(hud_style[STYLE_CHAT_PANEL], 0.0f, 1.0f);
+  /* GLOBAL has its own colours (OM, 2026-10-18). */
+  bool global_tab = chat_tab == CHAT_TAB_GLOBAL;
+  int name_colour = (int)hud_style[global_tab ? STYLE_GLOBAL_NAME : STYLE_CHAT_NAME];
+  int text_colour = (int)hud_style[global_tab ? STYLE_GLOBAL_TEXT : STYLE_CHAT_TEXT];
+  ImFont* bold = usr->imgui_data.regular_font_bold[FONT_SIZE_SMALL];
+  ImFont* regular = usr->imgui_data.regular_font[FONT_SIZE_SMALL];
+  if (!bold || !regular) return;
+  int bold_flags = hud_lock(bold);
+  int regular_flags = hud_lock(regular);
+  float text_size = regular->LegacySize * scale;
+  float label_size = bold->LegacySize * 0.86f * scale;
+  float pad = 12.0f * scale;
+  ImDrawList* draw = igGetForegroundDrawList_ViewportPtr(NULL);
+  float centre_x = anchored ? chat_anchor[0] : env->ctx->size[0] - 220.0f;
+  float centre_y = anchored ? chat_anchor[1] : 120.0f;
+  /* The editor stays fully open so its hit box matches. A match animates,
+     and the editor does not wipe the fold the player left it in. */
+  float openness = preview ? (chat_button_preview ? 0.0f : 1.0f) : chat_fold_sample();
+
+  /* Unread per tab (OM, 2026-10-14): a tab is read while it is shown; the
+     folded pill adds both up. The first list that arrives is not unread. */
+  bool open_now = openness > 0.5f;
+  if (seen_chat_total < 0 && frame_chat_total > 0) seen_chat_total = frame_chat_total;
+  if (seen_global_total < 0 && frame_global_total > 0)
+    seen_global_total = frame_global_total;
+  if (open_now && chat_tab == CHAT_TAB_TEAM) seen_chat_total = frame_chat_total;
+  if (open_now && chat_tab == CHAT_TAB_GLOBAL) seen_global_total = frame_global_total;
+  long team_unread = seen_chat_total >= 0 && frame_chat_total > seen_chat_total
+                         ? frame_chat_total - seen_chat_total
+                         : 0;
+  long global_unread =
+      seen_global_total >= 0 && frame_global_total > seen_global_total
+          ? frame_global_total - seen_global_total
+          : 0;
+  if (preview) team_unread = global_unread = 0;
+  long unread = open_now ? 0 : team_unread + global_unread;
+
+  const char* label = "CHAT";
+  bool online = chat_tab == CHAT_TAB_ONLINE;
+  float label_w = hud_text_width(bold, label_size, label, NULL);
+  char badge[16] = {0};
+  if (unread > 0)
+    snprintf(badge, sizeof(badge), "%ld", unread > 99 ? 99 : unread);
+  float badge_w = badge[0] ? hud_text_width(bold, label_size, badge, NULL) +
+                                 14.0f * scale
+                           : 0.0f;
+  /* The folded window is a chat button drawn like the on-screen keys, with
+     its own size, opacity, label and fill (OM, 2026-10-18). */
+  float btn_scale = hud_clamp(hud_style[STYLE_BTN_SCALE], 0.6f, 2.5f);
+  float btn_opacity = hud_clamp(hud_style[STYLE_BTN_OPACITY], 0.1f, 1.0f);
+  int btn_label_index = (int)hud_style[STYLE_BTN_LABEL];
+  int btn_fill_index = (int)hud_style[STYLE_BTN_FILL];
+  float pill_w = (label_w + badge_w + 44.0f * scale) * btn_scale;
+  float pill_h = (label_size + 26.0f * scale) * btn_scale;
+  float full_w =
+      hud_clamp(hud_style[STYLE_CHAT_WIDTH], 240.0f, 1000.0f) * scale;
+  float full_h =
+      hud_clamp(hud_style[STYLE_CHAT_HEIGHT], 150.0f, 900.0f) * scale;
+  float full_left, full_top;
+  hud_place(env, centre_x, centre_y, full_w, full_h, &full_left, &full_top);
+  chat_full_cx = full_left + full_w * 0.5f;
+  /* Idle only. Mid-animation the corner stays where the fold began. */
+  if (!chat_fold_at)
+    chat_fold_corner = (chat_full_cx < env->ctx->size[0] * 0.5f) ? -1 : 1;
+
+  float vis_w = pill_w + (full_w - pill_w) * openness;
+  float vis_h = pill_h + (full_h - pill_h) * openness;
+  float left = chat_fold_corner < 0 ? full_left : (full_left + full_w - vis_w);
+  float top = full_top;
+  ImVec2 min = {left, top};
+  ImVec2 max = {left + vis_w, top + vis_h};
+  float key_corner = pill_h * 0.30f;
+  float radius = key_corner + (14.0f * scale - key_corner) * openness;
+  hud_card(draw, min, max, radius, panel * opacity * openness);
+  float btn_alpha = btn_opacity * (1.0f - openness);
+  ImU32 btn_ink = btn_label_index > 0
+                      ? hud_text_colour(btn_label_index, ARENA_THEME_INK, 1.0f - openness)
+                      : team_colour(1, 1, 1, 1.0f - openness);
+  if (btn_alpha > 0.01f) {
+    /* As a key: a soft shadow, the fill, then a 1.5 px border. */
+    ImDrawList_AddRectFilled(draw, (ImVec2){min.x, min.y + vis_h * 0.07f},
+                             (ImVec2){max.x, max.y + vis_h * 0.07f},
+                             team_colour(0, 0, 0, btn_alpha * 0.16f), radius, 0);
+    ImU32 fill = btn_fill_index == 9
+                     ? team_colour(0.502f, 0.502f, 0.502f, btn_alpha * 0.94f)
+                     : hud_text_colour(btn_fill_index, ARENA_THEME_CARD,
+                                       btn_alpha * 0.94f);
+    ImDrawList_AddRectFilled(draw, min, max, fill, radius, 0);
+    ImDrawList_AddRect(draw, min, max,
+                       btn_label_index > 0
+                           ? hud_text_colour(btn_label_index, ARENA_THEME_INK,
+                                             0.9f * (1.0f - openness))
+                           : team_colour(1, 1, 1, 0.9f * (1.0f - openness)),
+                       radius, 0, 1.5f);
+  }
+
+  ImDrawList_PushClipRect(draw, min, max, true);
+  float pill_alpha = 1.0f - openness;
+  if (pill_alpha > 0.02f) {
+    /* Label and badge keep full contrast, as on the keys. */
+    float bs = btn_scale;
+    float bl = label_size * bs;
+    ImDrawList_AddText_FontPtr(
+        draw, bold, bl,
+        (ImVec2){left + 22.0f * scale * bs, top + (vis_h - bl) * 0.5f},
+        btn_ink, label, NULL, 0.0f, NULL);
+    if (badge[0]) {
+      float bx = left + (22.0f * scale + label_w + 8.0f * scale) * bs;
+      float bh = (label_size + 6.0f * scale) * bs;
+      float by = top + (vis_h - bh) * 0.5f;
+      ImDrawList_AddRectFilled(
+          draw, (ImVec2){bx, by}, (ImVec2){bx + badge_w * bs, by + bh},
+          arena_theme_colour(ARENA_THEME_BADGE, pill_alpha), 999.0f, 0);
+      ImDrawList_AddText_FontPtr(
+          draw, bold, bl,
+          (ImVec2){bx + 7.0f * scale * bs, by + 3.0f * scale * bs},
+          team_colour(1, 1, 1, pill_alpha), badge, NULL, 0.0f, NULL);
+    }
+  }
+
+  float body_alpha = opacity * openness;
+  float header_h = label_size + 18.0f * scale;
+  float input_h = text_size + 16.0f * scale;
+  ImVec2 input_min = {left + pad * 0.6f, top + vis_h - pad * 0.6f - input_h};
+  ImVec2 input_max = {left + vis_w - pad * 0.6f, top + vis_h - pad * 0.6f};
+  if (body_alpha > 0.02f) {
+    /* The tabs (OM, 2026-10-14): the shown one in ink, underlined. A header
+       tap outside them still folds the window. */
+    static const char* tab_names[CHAT_TAB_COUNT] = {"TEAM", "GLOBAL", "ONLINE"};
+    long tab_unread[CHAT_TAB_COUNT] = {team_unread, global_unread, 0};
+    char tab_count[CHAT_TAB_COUNT][8];
+    float close_w = 46.0f * scale;
+    float badge_size = label_size * 0.78f;
+    /* The tabs shrink to fit beside the X on a narrow window. */
+    float total = 18.0f * scale * (CHAT_TAB_COUNT - 1);
+    for (int t = 0; t < CHAT_TAB_COUNT; ++t) {
+      tab_count[t][0] = '\0';
+      if (tab_unread[t] > 0)
+        snprintf(tab_count[t], sizeof(tab_count[t]), "%ld",
+                 tab_unread[t] > 99 ? 99 : tab_unread[t]);
+      total += hud_text_width(bold, label_size, tab_names[t], NULL);
+      if (tab_count[t][0])
+        total += hud_text_width(bold, badge_size, tab_count[t], NULL) +
+                 14.0f * scale;
+    }
+    float room = vis_w - pad - close_w - pad * 0.5f;
+    float fit = total > room && total > 0.0f ? room / total : 1.0f;
+    if (fit < 0.6f) fit = 0.6f;
+    float tab_size = label_size * fit;
+    float tab_x = left + pad;
+    for (int t = 0; t < CHAT_TAB_COUNT; ++t) {
+      float tw = hud_text_width(bold, tab_size, tab_names[t], NULL);
+      bool shown = t == chat_tab;
+      ImDrawList_AddText_FontPtr(
+          draw, bold, tab_size,
+          (ImVec2){tab_x, top + (header_h - tab_size) * 0.5f},
+          arena_theme_colour(shown ? ARENA_THEME_INK : ARENA_THEME_QUIET,
+                             body_alpha),
+          tab_names[t], NULL, 0.0f, NULL);
+      if (shown)
+        ImDrawList_AddLine(
+            draw, (ImVec2){tab_x, top + header_h - 3.0f * scale},
+            (ImVec2){tab_x + tw, top + header_h - 3.0f * scale},
+            arena_theme_colour(ARENA_THEME_INK, body_alpha), 2.0f * scale);
+      float bw = 0.0f;
+      if (tab_count[t][0]) {
+        float bs = badge_size * fit;
+        float nw = hud_text_width(bold, bs, tab_count[t], NULL);
+        float bh = bs + 4.0f * scale;
+        float bx = tab_x + tw + 5.0f * scale;
+        float by = top + (header_h - bh) * 0.5f;
+        ImDrawList_AddRectFilled(
+            draw, (ImVec2){bx, by}, (ImVec2){bx + nw + 9.0f * scale, by + bh},
+            arena_theme_colour(ARENA_THEME_BADGE, body_alpha), 999.0f, 0);
+        ImDrawList_AddText_FontPtr(
+            draw, bold, bs, (ImVec2){bx + 4.5f * scale, by + 2.0f * scale},
+            team_colour(1, 1, 1, body_alpha), tab_count[t], NULL, 0.0f, NULL);
+        bw = nw + 14.0f * scale;
+      }
+      chat_tab_rect[t][0] = tab_x - 6.0f * scale;
+      chat_tab_rect[t][1] = top;
+      chat_tab_rect[t][2] = tw + bw + 12.0f * scale;
+      chat_tab_rect[t][3] = header_h;
+      tab_x += tw + bw + 18.0f * scale * fit;
+    }
+    /* The X (OM, 2026-10-14): folds the window in one tap; its hit area is
+       the whole corner, a little past the panel's edge. */
+    float close_cx = left + vis_w - pad * 0.5f - close_w * 0.5f;
+    float close_cy = top + header_h * 0.5f;
+    float arm = 6.5f * scale;
+    ImDrawList_AddLine(
+        draw, (ImVec2){close_cx - arm, close_cy - arm},
+        (ImVec2){close_cx + arm, close_cy + arm},
+        arena_theme_colour(ARENA_THEME_INK, 0.85f * body_alpha), 2.5f * scale);
+    ImDrawList_AddLine(
+        draw, (ImVec2){close_cx - arm, close_cy + arm},
+        (ImVec2){close_cx + arm, close_cy - arm},
+        arena_theme_colour(ARENA_THEME_INK, 0.85f * body_alpha), 2.5f * scale);
+    chat_close_rect[0] = close_cx - close_w * 0.5f;
+    chat_close_rect[1] = top - 10.0f * scale;
+    chat_close_rect[2] = close_w + pad * 0.5f + 8.0f * scale;
+    chat_close_rect[3] = header_h + 20.0f * scale;
+    ImDrawList_AddLine(
+        draw, (ImVec2){left + pad, top + header_h},
+        (ImVec2){left + vis_w - pad, top + header_h},
+        arena_theme_colour(ARENA_THEME_RULE, 0.8f * body_alpha), 1.0f);
+    /* ONLINE is a list only: no message box. */
+    if (!online) {
+      ImDrawList_AddRectFilled(
+          draw, input_min, input_max,
+          arena_theme_colour(ARENA_THEME_WELL, 0.9f * body_alpha), 999.0f, 0);
+      ImDrawList_AddText_FontPtr(
+          draw, regular, text_size,
+          (ImVec2){input_min.x + pad,
+                   input_min.y + (input_h - text_size) * 0.5f},
+          arena_theme_colour(ARENA_THEME_QUIET, body_alpha),
+          chat_tab == CHAT_TAB_GLOBAL ? "Message everyone" : "Message", NULL,
+          0.0f, NULL);
+    }
+
+    float list_top = top + header_h + 4.0f * scale;
+    float list_bottom =
+        online ? top + vis_h - pad * 0.6f : input_min.y - 6.0f * scale;
+    float list_left = left + pad;
+    float list_width = vis_w - pad * 2.0f;
+    if (online) list_width -= 10.0f * scale;
+    if (list_width < text_size) list_width = text_size;
+    float gap = 5.0f * scale;
+    int lines = preview ? 4
+                : online ? frame_online_count
+                : chat_tab == CHAT_TAB_GLOBAL ? frame_global_count
+                : frame_chat_count;
+    int lead_colour = online ? (int)hud_style[STYLE_ONLINE_NAME] : name_colour;
+    int body_colour = online ? (int)hud_style[STYLE_ONLINE_DATA] : text_colour;
+    float content = 0.0f;
+    for (int i = 0; i < lines; ++i) {
+      const char* author = "";
+      const char* body = "";
+      chat_row(i, preview, &author, &body);
+      char lead[64];
+      snprintf(lead, sizeof(lead), online ? "%s" : "%s: ", author);
+      float lead_w = hud_text_width(bold, text_size, lead, NULL);
+      bool own_line = online || lead_w > list_width * 0.6f;
+      float h = hud_wrap(NULL, regular, text_size, 0, 0, list_width,
+                         own_line ? 0.0f : lead_w, body, 0);
+      if (own_line) h += text_size * 1.22f;
+      content += h + gap;
+    }
+    float list_height = list_bottom - list_top;
+    if (list_height > 4.0f) {
+      float most = content > list_height ? content - list_height : 0.0f;
+      chat_scroll = hud_clamp(chat_scroll, 0.0f, most);
+      ImDrawList_PushClipRect(draw, (ImVec2){left, list_top},
+                              (ImVec2){max.x, list_bottom}, true);
+      if (lines == 0) {
+        const char* empty = online ? "No one online" : "No messages yet";
+        float w = hud_text_width(regular, text_size, empty, NULL);
+        ImDrawList_AddText_FontPtr(
+            draw, regular, text_size,
+            (ImVec2){left + (vis_w - w) * 0.5f,
+                     list_top + (list_height - text_size) * 0.5f},
+            arena_theme_colour(ARENA_THEME_QUIET, body_alpha), empty, NULL,
+            0.0f, NULL);
+      }
+      /* ONLINE lists from the top (OM, 2026-10-14); chats from the newest up. */
+      online_scroll = hud_clamp(online_scroll, 0.0f, most);
+      float y = online ? list_top - online_scroll : list_bottom + chat_scroll;
+      for (int k = 0; k < lines; ++k) {
+        int i = online ? k : lines - 1 - k;
+        const char* author = "";
+        const char* body = "";
+        chat_row(i, preview, &author, &body);
+        char lead[64];
+        snprintf(lead, sizeof(lead), online ? "%s" : "%s: ", author);
+        float lead_w = hud_text_width(bold, text_size, lead, NULL);
+        bool own_line = online || lead_w > list_width * 0.6f;
+        float h = hud_wrap(NULL, regular, text_size, 0, 0, list_width,
+                           own_line ? 0.0f : lead_w, body, 0);
+        if (own_line) h += text_size * 1.22f;
+        float row_y;
+        if (online) {
+          row_y = y;
+          y += h + gap;
+          if (row_y + h < list_top) continue;
+          if (row_y > list_bottom) break;
+        } else {
+          y -= h + gap;
+          row_y = y;
+          if (row_y > list_bottom) continue;
+          if (row_y + h < list_top) break;
+        }
+        ImDrawList_AddText_FontPtr(
+            draw, bold, text_size, (ImVec2){list_left, row_y},
+            hud_text_colour(lead_colour, ARENA_THEME_INK, body_alpha), lead,
+            NULL, 0.0f, NULL);
+        float body_y = own_line ? row_y + text_size * 1.22f : row_y;
+        hud_wrap(draw, regular, text_size, list_left, body_y, list_width,
+                 own_line ? 0.0f : lead_w, body,
+                 hud_text_colour(body_colour, ARENA_THEME_INK,
+                                 0.92f * body_alpha));
+      }
+      ImDrawList_PopClipRect(draw);
+      /* The scroll bar (OM, 2026-10-14): the list scrolls, and the thumb
+         shows how far down it is. */
+      if (online && most > 0.5f && content > 0.0f) {
+        float bar_x = left + vis_w - pad * 0.55f;
+        float thumb_h = list_height * list_height / content;
+        if (thumb_h < 24.0f * scale) thumb_h = 24.0f * scale;
+        if (thumb_h > list_height) thumb_h = list_height;
+        float thumb_y = list_top + (list_height - thumb_h) * (online_scroll / most);
+        ImDrawList_AddLine(
+            draw, (ImVec2){bar_x, list_top}, (ImVec2){bar_x, list_bottom},
+            arena_theme_colour(ARENA_THEME_RULE, 0.7f * body_alpha), 3.0f * scale);
+        ImDrawList_AddLine(
+            draw, (ImVec2){bar_x, thumb_y}, (ImVec2){bar_x, thumb_y + thumb_h},
+            arena_theme_colour(ARENA_THEME_INK, 0.6f * body_alpha), 3.0f * scale);
+      }
+    }
+  }
+  ImDrawList_PopClipRect(draw);
+
+  float shown_header = header_h * openness + vis_h * (1.0f - openness);
+  chat_rect[0] = left;
+  chat_rect[1] = top;
+  chat_rect[2] = vis_w;
+  chat_rect[3] = vis_h;
+  chat_header[0] = left;
+  chat_header[1] = top;
+  chat_header[2] = vis_w;
+  chat_header[3] = shown_header;
+  if (openness > 0.72f && !online) {
+    chat_input[0] = input_min.x;
+    chat_input[1] = input_min.y;
+    chat_input[2] = input_max.x - input_min.x;
+    chat_input[3] = input_max.y - input_min.y;
+  }
+  /* The respawn toggle hangs off this, beside the header. */
+  chat_button[0] = left;
+  chat_button[1] = top;
+  chat_button[2] = vis_w;
+  chat_button[3] = shown_header;
+  hud_unlock(bold, bold_flags);
+  hud_unlock(regular, regular_flags);
+}
+
+bool android_team_hud_touch(tenv* env, int type, unsigned long long finger,
+                            float x, float y) {
+  if (!env) return false;
+  if (env->usr->gdata.curr_screen != PLAYING ||
+      env->usr->gdata.conn != CONNECTED) {
+    hud_touch_mode = 0;
+    return false;
+  }
+  if (type == SDL_EVENT_FINGER_DOWN) {
+    if (hud_touch_mode) return false;
+    /* The X (OM, 2026-10-14): one tap folds the window, even a small one. */
+    if (chat_openness > 0.72f && hud_inside(chat_close_rect, x, y)) {
+      chat_toggle_fold(env->ctx->size[0]);
+      return true;
+    }
+    if (hud_inside(chat_rect, x, y)) {
+      /* A tab (OM, 2026-10-14) shows its list. */
+      if (chat_openness > 0.72f)
+        for (int t = 0; t < CHAT_TAB_COUNT; ++t)
+          if (hud_inside(chat_tab_rect[t], x, y)) {
+            android_team_set_chat_tab(t);
+            return true;
+          }
+      /* Mostly closed: the whole pill toggles. Open: only the header does.
+         The composer is live only once the window is mostly open. */
+      if (chat_openness < 0.5f || hud_inside(chat_header, x, y)) {
+        chat_toggle_fold(env->ctx->size[0]);
+        return true;
+      }
+      if (chat_openness > 0.72f && hud_inside(chat_input, x, y)) {
+        open_chat(env);
+        return true;
+      }
+      hud_touch_mode = 2;
+    } else if (hud_inside(roster_rect, x, y)) {
+      hud_touch_mode = 1;
+    } else {
+      return false;
+    }
+    hud_touch_finger = finger;
+    hud_touch_last_y = y;
+    return true;
+  }
+  if (!hud_touch_mode || finger != hud_touch_finger) return false;
+  if (type == SDL_EVENT_FINGER_MOTION) {
+    float dy = y - hud_touch_last_y;
+    hud_touch_last_y = y;
+    if (hud_touch_mode == 1)
+      roster_scroll -= dy;
+    else if (chat_tab == CHAT_TAB_ONLINE)
+      online_scroll -= dy;
+    else
+      chat_scroll += dy;
+    return true;
+  }
+  if (type == SDL_EVENT_FINGER_UP || type == SDL_EVENT_FINGER_CANCELED) {
+    hud_touch_mode = 0;
+    return true;
+  }
+  return false;
+}
+
+#ifdef WYRM_DESKTOP
+/* Wyrm Desktop (OM, 2026-10-11): the wheel over the roster or the chat
+   window scrolls it, as a finger drag does; anywhere else it zooms. Wheel up
+   is a drag down: the older lines come into view. */
+bool android_team_hud_wheel(tenv* env, float x, float y, float notches) {
+  if (!env || env->usr->gdata.curr_screen != PLAYING ||
+      env->usr->gdata.conn != CONNECTED)
+    return false;
+  const float step = 42.0f;
+  if (hud_inside(chat_rect, x, y)) {
+    if (chat_openness > 0.5f) {
+      if (chat_tab == CHAT_TAB_ONLINE)
+        online_scroll -= notches * step;
+      else
+        chat_scroll += notches * step;
+    }
+    return true;
+  }
+  if (hud_inside(roster_rect, x, y)) {
+    roster_scroll -= notches * step;
+    return true;
+  }
+  return false;
+}
+
+/* Whether a press at (x, y) lands on the roster or the chat window. */
+bool android_team_hud_contains(float x, float y) {
+  return hud_inside(chat_rect, x, y) || hud_inside(roster_rect, x, y);
+}
+
+/* Where the roster and the chat window were drawn last frame, in pixels:
+   x, y, width, height of each (zero width when not drawn). The desktop's
+   arena UI editor grabs them by these, so its hit boxes are the engine's. */
+JNIEXPORT jfloatArray JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeDesktopTeamRects(JNIEnv* env,
+                                                           jclass clazz) {
+  (void)clazz;
+  float out[8];
+  memcpy(out, roster_rect, sizeof(float) * 4);
+  memcpy(out + 4, chat_rect, sizeof(float) * 4);
+  jfloatArray result = (*env)->NewFloatArray(env, 8);
+  if (result) (*env)->SetFloatArrayRegion(env, result, 0, 8, out);
+  return result;
+}
+#endif
+
+/* ------------------------------------------------- auto respawn, in the arena
+ *
+ * It lives beside the chat button because that is the only anchor on this side
+ * of the screen, and it is drawn here for the same reason — `chat_button` is
+ * the rectangle it hangs off.
+ *
+ * It is only ever shown while auto respawn is *on*, and pressing it only ever
+ * turns it off. There is no second state to draw: once it is off, dying puts
+ * the card up, and the card is where turning it back on lives. So the button
+ * does not toggle in place, it leaves — and it leaves in a way you notice,
+ * because a control that silently vanishes reads as a bug.
+ */
+/* Long enough after the match starts that it is not part of the rush of things
+   appearing at once, and short enough to still be about this match. */
+#define RESPAWN_ARRIVE_MS 3000
+#define SPARKLE_MS 500
+
+/*
+ * All three timers are SDL ticks and none of them is `glfwGetTime()`.
+ *
+ * That distinction cost a bug: the arena calls `glfwSetTime(0)` on every
+ * connect, so a timestamp taken before a match and compared after it goes
+ * *negative*. The sparkle read as "still running, forever", and the button
+ * never came back — turn it off, die, turn it back on from the card, and it
+ * was simply gone for the rest of the session.
+ */
+static float respawn_button[4] = {0, 0, 0, 0};
+static Uint64 respawn_arrive_at = 0;
+static Uint64 respawn_leaving_at = 0;
+
+/** The specks, thrown out or drawn in depending on which way it is going. */
+static void draw_sparkle(ImDrawList* draw, float cx, float cy, float t,
+                         bool arriving) {
+  float spread = arriving ? (1.0f - t) : (1.0f - (1.0f - t) * (1.0f - t));
+  float alpha = arriving ? t : (1.0f - t);
+  for (int i = 0; i < 8; ++i) {
+    float a = (float)i / 8.0f * 6.28318530718f;
+    float reach = (26.0f + (i % 3) * 13.0f) * spread;
+    ImVec2 at = {cx + cosf(a) * reach * 1.5f, cy + sinf(a) * reach};
+    ImDrawList_AddCircleFilled(draw, at, 3.4f * alpha,
+                               arena_theme_overlay_text(0.85f * alpha), 0);
+  }
+}
+
+/* 0: the old in-arena auto-respawn pill is off (OM, 2026-10-05). */
+#define WYRM_RESPAWN_PILL 0
+
+void android_team_draw_respawn_toggle(tenv* env) {
+  respawn_button[2] = 0.0f;
+  respawn_button[3] = 0.0f;
+  if (!env) return;
+  /* The on-screen Auto restart key is the switch now and sits in the arena
+     itself (OM, 2026-10-05), so this old "TURN OFF AUTO" pill is never drawn.
+     A zero-sized button also means android_team_respawn_toggle_hit never
+     takes a touch. */
+  if (!WYRM_RESPAWN_PILL) {
+    respawn_arrive_at = 0;
+    respawn_leaving_at = 0;
+    return;
+  }
+  tuser_data* usr = env->usr;
+  user_settings* usrs = &usr->usrs;
+
+  if (usr->gdata.curr_screen != PLAYING || usr->gdata.conn != CONNECTED ||
+      chat_button[2] <= 0.0f) {
+    /* Out of the arena the count starts again, so every match gets its own
+       three seconds rather than inheriting the last one's. */
+    respawn_arrive_at = 0;
+    respawn_leaving_at = 0;
+    return;
+  }
+
+  Uint64 now = SDL_GetTicks();
+  ImFont* font = usr->imgui_data.body_font[FONT_SIZE_REGULAR];
+  /* Says what pressing it does, not what is currently true. "AUTO" said
+     neither, and a button that only ever turns something off should say so. */
+  const char* label = "TURN OFF AUTO";
+  ImVec2 size;
+  igPushFont(font, font->LegacySize);
+  igCalcTextSize(&size, label, NULL, false, -1);
+  igPopFont();
+
+  float height = chat_button[3];
+  float width = size.x + 44.0f;
+  float x = chat_button[0] - width - 12.0f;
+  float y = chat_button[1];
+  float cx = x + width * 0.5f;
+  float cy = y + height * 0.5f;
+  ImDrawList* draw = igGetForegroundDrawList_ViewportPtr(NULL);
+
+  if (!usrs->auto_respawn) {
+    respawn_arrive_at = 0;
+    if (!respawn_leaving_at) return;
+    float t = (float)(now - respawn_leaving_at) / (float)SPARKLE_MS;
+    if (t >= 1.0f) {
+      respawn_leaving_at = 0;
+      return;
+    }
+    draw_sparkle(draw, cx, cy, t, false);
+    return;
+  }
+
+  respawn_leaving_at = 0;
+  if (!respawn_arrive_at) respawn_arrive_at = now + RESPAWN_ARRIVE_MS;
+  if (now < respawn_arrive_at) return;
+
+  float t = (float)(now - respawn_arrive_at) / (float)SPARKLE_MS;
+  if (t < 1.0f) {
+    /* Arriving, the same way it leaves — so the two read as one thing coming
+       and going rather than two unrelated effects. */
+    draw_sparkle(draw, cx, cy, t, true);
+    return;
+  }
+
+  respawn_button[0] = x;
+  respawn_button[1] = y;
+  respawn_button[2] = width;
+  respawn_button[3] = height;
+
+  ImVec2 min = {x, y};
+  ImVec2 max = {x + width, y + height};
+  ImDrawList_AddRectFilled(draw, (ImVec2){min.x, min.y + 3},
+                           (ImVec2){max.x, max.y + 3},
+                           team_colour(0, 0, 0, 0.26f), 999.0f, 0);
+  /* Red rather than green: it is a stop, not a state. */
+  ImDrawList_AddRectFilled(draw, min, max,
+                           arena_theme_colour(ARENA_THEME_BADGE, 0.18f), 999.0f,
+                           0);
+  ImDrawList_AddRect(draw, min, max,
+                     arena_theme_colour(ARENA_THEME_BADGE, 0.58f),
+                     999.0f, 0, 1.5f);
+  ImDrawList_AddText_FontPtr(draw, font, font->LegacySize,
+                             (ImVec2){x + (width - size.x) * 0.5f,
+                                      y + (height - size.y) * 0.5f},
+                             arena_theme_colour(ARENA_THEME_BADGE, 1.0f), label,
+                             NULL,
+                             0, NULL);
+}
+
+bool android_team_respawn_toggle_hit(tenv* env, float x, float y) {
+  if (!env || respawn_button[2] <= 0.0f) return false;
+  if (env->usr->gdata.curr_screen != PLAYING ||
+      env->usr->gdata.conn != CONNECTED)
+    return false;
+  bool hit = x >= respawn_button[0] &&
+             x <= respawn_button[0] + respawn_button[2] &&
+             y >= respawn_button[1] &&
+             y <= respawn_button[1] + respawn_button[3];
+  if (!hit) return false;
+  env->usr->usrs.auto_respawn = 0;
+  save_user_settings(&env->usr->usrs);
+  respawn_leaving_at = SDL_GetTicks();
+  respawn_arrive_at = 0;
+  SDL_Log("Wyrm: auto respawn off");
+  return true;
+}
+
+bool android_team_chat_button_hit(tenv* env, float x, float y) {
+  /* The chat window takes its own touches now (android_team_hud_touch), and
+     chat no longer asks for the bot: it is played through while open. */
+  (void)env;
+  (void)x;
+  (void)y;
+  return false;
+}
+
+/**
+ * What the chat button said when it refused, and the key it offered.
+ *
+ * Drawn after the chat button so it can hang off its rectangle, and only while
+ * in a match — a hint about steering means nothing on a menu.
+ */
+void android_team_draw_chat_help(tenv* env) {
+  bot_helper[2] = 0.0f;
+  bot_helper[3] = 0.0f;
+  if (!env) return;
+  tuser_data* usr = env->usr;
+  user_settings* usrs = &usr->usrs;
+  if (usr->gdata.curr_screen != PLAYING || usr->gdata.conn != CONNECTED) {
+    /* Leaving the arena is the only thing that takes it away. */
+    bot_helper_shown = false;
+    chat_hint_until = 0;
+    return;
+  }
+  /*
+   * Chat being open hides it and must not forget it.
+   *
+   * That distinction is the whole of a bug: this used to clear the flag here,
+   * so opening chat once and closing it took the button away for good — and
+   * with it the only way a player without a bot key had of turning the bot
+   * back off. Once it has been asked for, it stays for the rest of the match.
+   */
+  if (chat_open || chat_button[2] <= 0.0f) return;
+
+  Uint64 now = SDL_GetTicks();
+  bool bot_on = usrs->hotkeys[HOTKEY_BOT].active;
+  ImDrawList* draw = igGetForegroundDrawList_ViewportPtr(NULL);
+  float top = chat_button[1] + chat_button[3] + 10.0f;
+
+  if (bot_helper_shown) {
+    ImFont* font = usr->imgui_data.body_font[FONT_SIZE_REGULAR];
+    const char* label = bot_on ? "BOT ON" : "BOT OFF";
+    ImVec2 size;
+    igPushFont(font, font->LegacySize);
+    igCalcTextSize(&size, label, NULL, false, -1);
+    igPopFont();
+
+    float width = chat_button[2];
+    float height = chat_button[3];
+    float x = chat_button[0];
+    ImVec2 min = {x, top};
+    ImVec2 max = {x + width, top + height};
+    bot_helper[0] = x;
+    bot_helper[1] = top;
+    bot_helper[2] = width;
+    bot_helper[3] = height;
+
+    ImDrawList_AddRectFilled(draw, (ImVec2){min.x, min.y + 3},
+                             (ImVec2){max.x, max.y + 3},
+                             team_colour(0, 0, 0, 0.26f), 999.0f, 0);
+    ImDrawList_AddRectFilled(
+        draw, min, max,
+        bot_on ? arena_theme_colour(ARENA_THEME_LIVE, 0.26f)
+               : arena_theme_colour(ARENA_THEME_CARD, 0.92f),
+        999.0f, 0);
+    ImDrawList_AddRect(draw, min, max,
+                       bot_on ? arena_theme_colour(ARENA_THEME_LIVE, 0.60f)
+                              : arena_theme_colour(ARENA_THEME_INK, 0.34f),
+                       999.0f, 0, 1.5f);
+    ImDrawList_AddText_FontPtr(draw, font, font->LegacySize,
+                               (ImVec2){x + (width - size.x) * 0.5f,
+                                        top + (height - size.y) * 0.5f},
+                               arena_theme_colour(ARENA_THEME_INK, 0.94f), label,
+                               NULL, 0, NULL);
+    top += height + 10.0f;
+  }
+
+  if (now >= chat_hint_until) return;
+
+  ImFont* font = usr->imgui_data.body_font[FONT_SIZE_LARGE];
+  const char* text = chat_hint_has_own_key
+                         ? "First turn on the bot mode"
+                         : "Turn on the bot mode below the chat button";
+  ImVec2 size;
+  igPushFont(font, font->LegacySize);
+  igCalcTextSize(&size, text, NULL, false, -1);
+  igPopFont();
+
+  float right = chat_button[0] + chat_button[2];
+  ImVec2 min = {right - size.x - 34.0f, top};
+  ImVec2 max = {right, top + size.y + 22.0f};
+  ImDrawList_AddRectFilled(draw, (ImVec2){min.x, min.y + 3},
+                           (ImVec2){max.x, max.y + 3},
+                           team_colour(0, 0, 0, 0.30f), 12.0f, 0);
+  ImDrawList_AddRectFilled(draw, min, max,
+                           arena_theme_colour(ARENA_THEME_CARD, 0.96f), 12.0f,
+                           0);
+  ImDrawList_AddRect(draw, min, max,
+                     arena_theme_colour(ARENA_THEME_BADGE, 0.55f),
+                     12.0f, 0, 1.5f);
+  ImDrawList_AddText_FontPtr(draw, font, font->LegacySize,
+                             (ImVec2){min.x + 17.0f, min.y + 11.0f},
+                             arena_theme_colour(ARENA_THEME_INK, 0.94f), text,
+                             NULL, 0, NULL);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeCloseTeamChat(JNIEnv* env,
+                                                         jclass clazz,
+                                                         jfloat seconds) {
+  (void)env;
+  (void)clazz;
+  android_team_close_chat(seconds);
+}
+
+/* ------------------------------------------------------------------ bridge */
+
+/**
+ * Where this player is, for the next poll.
+ *
+ * Tab separated: nickname, score, x, y, bot, arena, rank. The arena is the
+ * literal `_GAME_MENU_` when not in a match, which is what the team service
+ * expects and what tells the others you are not on the map.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeTeamPresence(JNIEnv* env,
+                                                        jclass clazz) {
+  (void)clazz;
+  if (!team_mutex) return (*env)->NewStringUTF(env, "");
+  char line[sizeof(presence)];
+  SDL_LockMutex(team_mutex);
+  memcpy(line, presence, sizeof(line));
+  SDL_UnlockMutex(team_mutex);
+  return (*env)->NewStringUTF(env, line);
+}
+
+/** One line per member: name, x, y, score, rank, bot, in-this-arena. */
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetTeamMembers(JNIEnv* env,
+                                                          jclass clazz,
+                                                          jstring packed) {
+  (void)clazz;
+  if (!team_mutex) return;
+  const char* text = packed ? (*env)->GetStringUTFChars(env, packed, NULL) : "";
+
+  team_member parsed[TEAM_MAX_MEMBERS];
+  int count = 0;
+  const char* line = text;
+  while (line && *line && count < TEAM_MAX_MEMBERS) {
+    const char* end = strchr(line, '\n');
+    size_t length = end ? (size_t)(end - line) : strlen(line);
+    char row[512];
+    if (length >= sizeof(row)) length = sizeof(row) - 1;
+    memcpy(row, line, length);
+    row[length] = '\0';
+
+    team_member* member = &parsed[count];
+    memset(member, 0, sizeof(*member));
+    int x = 0, y = 0, score = 0, rank = 0, bot = 0, present = 0;
+    char name[64] = {0};
+    if (sscanf(row, "%63[^\t]\t%d\t%d\t%d\t%d\t%d\t%d", name, &x, &y, &score,
+               &rank, &bot, &present) == 7) {
+      snprintf(member->name, sizeof(member->name), "%s", name);
+      member->x = x;
+      member->y = y;
+      member->score = score;
+      member->rank = rank;
+      member->bot = bot != 0;
+      member->present = present != 0;
+      char sid_text[16];
+      tab_field(row, 7, sid_text, sizeof(sid_text));
+      member->sid = atoi(sid_text);
+      tab_field(row, 9, member->owner, sizeof(member->owner));
+      tab_field(row, 10, member->server, sizeof(member->server));
+      count++;
+    }
+    line = end ? end + 1 : NULL;
+  }
+
+  SDL_LockMutex(team_mutex);
+  member_count = count;
+  memcpy(members, parsed, sizeof(team_member) * (size_t)count);
+  SDL_UnlockMutex(team_mutex);
+  if (packed) (*env)->ReleaseStringUTFChars(env, packed, text);
+}
+
+/** The team chat, packed as android_team_set_chat reads it. */
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetTeamChat(JNIEnv* env,
+                                                       jclass clazz,
+                                                       jstring packed) {
+  (void)clazz;
+  const char* text = packed ? (*env)->GetStringUTFChars(env, packed, NULL) : "";
+  android_team_set_chat(text);
+  if (packed) (*env)->ReleaseStringUTFChars(env, packed, text);
+}
+
+/** Global chat and players online (OM, 2026-10-14), as their setters read them. */
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetGlobalChat(JNIEnv* env, jclass clazz,
+                                                         jstring packed) {
+  (void)clazz;
+  const char* text = packed ? (*env)->GetStringUTFChars(env, packed, NULL) : "";
+  android_team_set_global_chat(text);
+  if (packed) (*env)->ReleaseStringUTFChars(env, packed, text);
+}
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetOnlinePlayers(JNIEnv* env, jclass clazz,
+                                                            jstring packed) {
+  (void)clazz;
+  const char* text = packed ? (*env)->GetStringUTFChars(env, packed, NULL) : "";
+  android_team_set_online(text);
+  if (packed) (*env)->ReleaseStringUTFChars(env, packed, text);
+}
+JNIEXPORT jint JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeChatTab(JNIEnv* env, jclass clazz) {
+  (void)env;
+  (void)clazz;
+  return android_team_chat_tab();
+}
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetChatTab(JNIEnv* env, jclass clazz, jint tab) {
+  (void)env;
+  (void)clazz;
+  android_team_set_chat_tab(tab);
+}
+
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeToggleChatPanel(JNIEnv* env, jclass clazz) {
+  (void)env;
+  (void)clazz;
+  SDL_AddAtomicInt(&chat_toggle_pending, 1);
+}
+
+/** The roster's and chat window's look, as android_team_set_hud_style reads it. */
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetTeamHudStyle(JNIEnv* env,
+                                                          jclass clazz,
+                                                          jfloatArray values) {
+  (void)clazz;
+  if (!values) return;
+  jsize count = (*env)->GetArrayLength(env, values);
+  float copy[STYLE_COUNT];
+  if (count > STYLE_COUNT) count = STYLE_COUNT;
+  (*env)->GetFloatArrayRegion(env, values, 0, count, copy);
+  android_team_set_hud_style(copy, count);
+}
+
+#else
+
+#include "../game/arena_theme.h"
+
+void android_team_bind_env(tenv* env) { (void)env; }
+void android_team_poll(tenv* env) { (void)env; }
+bool android_team_is_teammate(tenv* env, int sid, const char* name) { (void)env; (void)sid; (void)name; return false; }
+void android_team_begin_frame(void) {}
+void android_team_tick(tenv* env) { (void)env; }
+void android_team_draw_chat_button(tenv* env) { (void)env; }
+void android_team_draw_respawn_toggle(tenv* env) { (void)env; }
+void android_team_draw_chat_help(tenv* env) { (void)env; }
+bool android_team_respawn_toggle_hit(tenv* env, float x, float y) {
+  (void)env; (void)x; (void)y;
+  return false;
+}
+bool android_team_chat_button_hit(tenv* env, float x, float y) {
+  (void)env;
+  (void)x;
+  (void)y;
+  return false;
+}
+void android_team_close_chat(float seconds) { (void)seconds; }
+void android_team_release_chat(tenv* env) { (void)env; }
+void android_team_set_chat_centre(float centre_x, float centre_y) {
+  (void)centre_x;
+  (void)centre_y;
+}
+bool android_team_chat_open(void) { return false; }
+float android_team_stats_panel(void) { return 1.0f; }
+unsigned int android_team_stats_colour(int role, float alpha) {
+  return arena_theme_colour((arena_theme_role)role, alpha);
+}
+void android_team_set_chat(const char* packed) { (void)packed; }
+void android_team_set_global_chat(const char* packed) { (void)packed; }
+void android_team_set_online(const char* packed) { (void)packed; }
+int android_team_chat_tab(void) { return 0; }
+void android_team_set_chat_tab(int tab) { (void)tab; }
+void android_team_set_hud_style(const float* values, int count) {
+  (void)values;
+  (void)count;
+}
+bool android_team_hud_touch(tenv* env, int type, unsigned long long finger,
+                            float x, float y) {
+  (void)env;
+  (void)type;
+  (void)finger;
+  (void)x;
+  (void)y;
+  return false;
+}
+void android_team_draw_minimap(tenv* env, float left, float top,
+                               float diameter) {
+  (void)env;
+  (void)left;
+  (void)top;
+  (void)diameter;
+}
+float android_team_draw_roster_centered(tenv* env, float centre_x,
+                                        float centre_y) {
+  (void)env;
+  (void)centre_x;
+  (void)centre_y;
+  return 0.0f;
+}
+
+#endif

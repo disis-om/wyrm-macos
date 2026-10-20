@@ -1,0 +1,5 @@
+* text=auto eol=lf
+SharedEngine/** -text
+*.png -text
+*.ttf -text
+*.spv -text

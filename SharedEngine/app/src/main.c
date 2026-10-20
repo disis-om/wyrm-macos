@@ -1,0 +1,425 @@
+#include "game/loop.h"
+#include "network/server.h"
+#include "platform/android_home.h"
+#include "platform/android_settings.h"
+#include "platform/android_team.h"
+#include "platform/android_skin.h"
+#include "platform/android_update.h"
+#include "ui/lobby.h"
+#include "ui/skin_editor.h"
+#include "ui/ui_theme.h"
+#include "ui/viewport.h"
+#include "mobile/mobile_controls.h"
+#include "mobile/mobile_hotkeys.h"
+#include "user.h"
+
+void tinput(tenv* env) {
+  tuser_data* usr = env->usr;
+  user_settings* usrs = &usr->usrs;
+
+  if (twindow_closed(env->wnd)) {
+    env->config.running = false;
+    save_user_settings(usrs);
+  }
+  if (tkeyboard_key_pressed(
+          env->kb,
+          mobile_hotkey_get_key(usrs, MOBILE_HOTKEY_FULLSCREEN)) ||
+      mobile_hotkeys_pressed(env, MOBILE_HOTKEY_FULLSCREEN)) {
+    twindow_toggle_fullscreen(env->wnd);
+  }
+  mobile_controls_update(env);
+}
+
+void tlaunch(tenv* env) {
+  tuser_data* usr = env->usr;
+  user_settings* usrs = &usr->usrs;
+  srand(time(NULL));
+
+  memset(usrs, 0, sizeof(user_settings));
+  strcpy(usrs->ipv4, "15.204.212.200:444");
+  strcpy(usrs->nickname, "");
+
+  usrs->custom_skin = false;
+  usrs->default_skin = rand() % 9;
+  usrs->accessory = NO_ACCESSORY;
+
+  read_user_settings(usrs);
+
+  /* Vsync always (OM, 2026-10-12, "same as the reference client"): FIFO only.
+     The settings file's `vsync` is no longer read. */
+  env->config.vsync = true;
+  env->config.fullscreen = false;
+  env->config.title = "Wyrm";
+}
+
+void tinit(tenv* env) {
+  tuser_data* usr = env->usr;
+
+  imgui_init(env);
+  mobile_controls_init(env);
+  mobile_hotkeys_init(env);
+  env->usr->r = renderer_create(env);
+  ui_viewport_init(env);
+  android_update_bind_env(env);
+  android_home_bind_env(env);
+  android_settings_bind_env(env);
+  android_team_bind_env(env);
+  android_skin_bind_env(env);
+  ui_skin_editor_init(env);
+  game_data_init(env);
+}
+
+void tdestroy(tenv* env) {
+  /* `env` is about to go (it lives on tentry's stack, usr is freed after this):
+     Compose can still ask for a snapshot from onPause. */
+  android_settings_bind_env(NULL);
+  game_data_destroy(env);
+  save_user_settings(&env->usr->usrs);
+  ui_skin_editor_destroy(env);
+  ui_viewport_destroy(env);
+  renderer_destroy(env->usr->r, env->ctx);
+  imgui_destroy();
+}
+
+/*
+ * Tells Java which screen the engine is on, so Compose can show the matching
+ * one. Reported on change only. Each Compose-owned screen is seeded with the
+ * state it needs just before it appears, and the first arrival at Home releases
+ * the startup gate that the native title screen used to release.
+ */
+static void sync_screen(tenv* env) {
+  static int reported = -1;
+  static int reported_arena_port_available = -1;
+  static bool title_ready_reported = false;
+  static bool skin_tables_published = false;
+
+  int screen = (int)env->usr->gdata.curr_screen;
+  game_data* gdata = &env->usr->gdata;
+  bool arena_port_available = screen != PLAYING &&
+      gdata->conn == DISCONNECTED && !gdata->connection;
+  if (reported_arena_port_available != (int)arena_port_available) {
+    reported_arena_port_available = (int)arena_port_available;
+    SDL_Log("Wyrm arena: port %s", arena_port_available ? "free" : "busy");
+    android_home_set_arena_port_available(arena_port_available);
+  }
+  if (screen == TITLE_SCREEN && !title_ready_reported) {
+    title_ready_reported = true;
+    android_update_notify_title_ready(&env->usr->usrs,
+                                      sizeof(env->usr->usrs));
+  }
+  if (reported == screen) return;
+  reported = screen;
+
+  if (screen == TITLE_SCREEN) {
+    android_home_publish_state(env);
+  } else if (screen == SKIN_EDITOR) {
+    // The palette and the preset sequences never change, so they cross the
+    // bridge once, the first time the editor is opened.
+    if (!skin_tables_published) {
+      skin_tables_published = true;
+      android_skin_publish_tables(env);
+    }
+    android_skin_publish_state(env);
+  }
+  android_home_set_screen(screen);
+}
+
+
+/*
+ * Performance (OM, 2026-10-01): the engine draws only where it can be seen.
+ *
+ * Home, Social, Settings and every other Compose / SwiftUI page are opaque,
+ * and the engine used to draw a whole frame under them every pass anyway. Now
+ * it draws in the lobby, in a match (the AI editors are matches), in the skin
+ * editor and for the Skin postcard. Leaving those, it draws a few settle
+ * frames, so what stays on the surface is the plain clear colour and never a
+ * stale arena, and then stops drawing. The polls at the top of trender still
+ * run every pass, so mailboxes, settings and the socket behave exactly as
+ * before. Nothing here reads or writes the protocol or the game.
+ */
+#define WYRM_SETTLE_FRAMES 4
+static int wyrm_settle = WYRM_SETTLE_FRAMES;
+
+static bool wyrm_engine_visible(tenv* env) {
+  /* Until a frame has reached the screen (start, a new surface), keep drawing. */
+  if (!env->ctx->last_present_succeeded) return true;
+  if (env->usr->gdata.curr_screen != TITLE_SCREEN || ui_skin_editor_postcard()) {
+    wyrm_settle = WYRM_SETTLE_FRAMES;
+    return true;
+  }
+  if (wyrm_settle > 0) {
+    wyrm_settle--;
+    return true;
+  }
+  return false;
+}
+
+#if defined(__ANDROID__) || defined(WYRM_DESKTOP)
+#include <stdatomic.h>
+#include <SDL3/SDL.h>
+
+/*
+ * Settings › Performance (OM, 2026-10-01), set by WyrmActivity / Wyrm
+ * Desktop: a frame cap (0 = none). Vsync is on always (OM, 2026-10-12, "same
+ * to same the reference client"): FIFO only, never IMMEDIATE, whatever `vsync` says. A cap
+ * is a sleep on a second clock next to the display's, which made a heavy
+ * frame miss its slot and show twice, so Android sends one only while the
+ * display runs faster than the player's limit (the display is asked for the
+ * limit first); Wyrm Desktop's hidden window does not wait for the monitor,
+ * so there the cap is the only clock.
+ */
+static atomic_int wyrm_policy_vsync = 1;
+static atomic_int wyrm_policy_cap = 0;
+
+/* Any thread. */
+void wyrm_set_frame_policy(int vsync, int cap) {
+  (void)vsync;
+  atomic_store(&wyrm_policy_vsync, 1);
+  atomic_store(&wyrm_policy_cap, cap > 0 ? cap : 0);
+}
+
+/* A changed present mode needs a new swapchain. While the engine is drawing
+ * it is rebuilt now, the way the old VSync switch did (`tresize` keeps the
+ * socket pumped). Under Compose nothing is drawn, so no extra rebuild is made
+ * there: the turn into the lobby rebuilds the swapchain anyway and takes the
+ * new mode. (6.3.2 crashed natively on the Moto while modes were switched on
+ * Home; this keeps swapchain rebuilds to the ones the app always made.) */
+static int wyrm_present_pending; /* frames the engine has been seen with a stale mode */
+
+static void wyrm_apply_present_mode(tenv* env) {
+  game_data* g = &env->usr->gdata;
+  bool seen = g->curr_screen != TITLE_SCREEN || ui_skin_editor_postcard();
+  int want = atomic_load(&wyrm_policy_vsync);
+  if (want >= 0 && env->config.vsync != (want == 1)) {
+    env->config.vsync = want == 1;
+    if (seen) {
+      twindow_request_refresh(env->wnd);
+      wyrm_present_pending = 0;
+    } else {
+      wyrm_present_pending = 1;
+    }
+    return;
+  }
+  /* Changed while hidden: give the lobby's own rotation rebuild a moment (it
+     clears this in tresize), then rebuild here if none came. */
+  if (wyrm_present_pending && seen && ++wyrm_present_pending > 30) {
+    wyrm_present_pending = 0;
+    twindow_request_refresh(env->wnd);
+  }
+}
+
+/* Idle under Compose: a light 40 Hz pass for the mailboxes. Drawing: hold the
+ * cap with a steady cadence (a late frame keeps the beat, a very late one
+ * starts a new one). */
+#define WYRM_IDLE_MS 25
+static void wyrm_pace(bool drew) {
+  static Uint64 next;
+  if (!drew) {
+    next = 0;
+    SDL_Delay(WYRM_IDLE_MS);
+    return;
+  }
+  int cap = atomic_load(&wyrm_policy_cap);
+  if (cap <= 0) {
+    next = 0;
+    return;
+  }
+  Uint64 period = (Uint64)SDL_NS_PER_SECOND / (Uint64)cap;
+  Uint64 now = SDL_GetTicksNS();
+  if (next == 0 || now > next + period) next = now;
+  else if (now < next) SDL_DelayPrecise(next - now);
+  next += period;
+}
+#endif
+
+/*
+ * Background play (OM, 2026-10-13): in the background the match carries on —
+ * the socket, the game and the bot — but nothing is drawn. iOS kills GPU work
+ * sent from the background (that was the "GPU lost" card after coming back);
+ * Android has no surface there. Set by the apps: Android WyrmActivity onStop /
+ * onStart, iOS Main.m on resign active / become active.
+ */
+#include <stdatomic.h>
+static atomic_int wyrm_background_on = 0;
+static bool wyrm_background_seen = false;
+
+void wyrm_set_background(bool on) {
+  atomic_store(&wyrm_background_on, on ? 1 : 0);
+}
+
+bool wyrm_background(void) { return atomic_load(&wyrm_background_on) != 0; }
+
+/* Engine thread. One background pass; false when the app is in front. */
+bool wyrm_background_tick(tenv* env) {
+  if (!wyrm_background()) {
+    wyrm_background_seen = false;
+    return false;
+  }
+  if (!wyrm_background_seen) {
+    wyrm_background_seen = true;
+    /* A finger down when the app went away never comes up: let it go, so a
+       held boost or joystick does not stay on in the background. */
+    env->usr->mobile_controls.joystick_down = false;
+    env->usr->mobile_controls.boost_down = false;
+    env->usr->mobile_controls.zoom_down = false;
+    env->usr->mobile_controls.aim_valid = false;
+    SDL_Log("Wyrm background: %s", env->usr->gdata.curr_screen == PLAYING
+                                       ? "the match keeps running"
+                                       : "waiting");
+  }
+  game_data* gdata = &env->usr->gdata;
+  if (gdata->curr_screen == PLAYING || gdata->connection) {
+    trender(env);
+  } else {
+#ifdef WYRM_SDL_JNI
+    /* Android's own loop: rest. iOS calls this from a timer on its main
+       thread, which must never sleep. */
+    SDL_Delay(100);
+#endif
+  }
+  return true;
+}
+
+#ifdef WYRM_SDL_JNI
+#include <jni.h>
+JNIEXPORT void JNICALL
+Java_com_wyrm_omrajput_WyrmActivity_nativeSetBackgroundPlay(JNIEnv* jenv,
+                                                            jclass clazz,
+                                                            jboolean on) {
+  (void)jenv;
+  (void)clazz;
+  wyrm_set_background(on);
+}
+#endif
+
+void trender(tenv* env) {
+  tuser_data* usr = env->usr;
+  tcontext* ctx = env->ctx;
+  game_data* gdata = &usr->gdata;
+
+#if defined(__ANDROID__) || defined(WYRM_DESKTOP)
+  wyrm_apply_present_mode(env);
+#endif
+  android_update_apply_pending_settings(env);
+  android_home_poll(env);
+  android_settings_poll(env);
+  android_team_poll(env);
+  android_skin_poll(env);
+  sync_screen(env);
+
+  imgui_prerender();
+  // render begin
+  ImGuiStyle* style = igGetStyle();
+  ui_viewport(env);
+
+  igSetNextWindowPos(igGetMainViewport()->Pos, ImGuiCond_None, (ImVec2){});
+  igSetNextWindowSize(igGetMainViewport()->Size, ImGuiCond_None);
+  igPushStyleVar_Float(ImGuiStyleVar_WindowBorderSize, 0);
+  igBegin("##fullscreen_holder", NULL,
+          ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoTitleBar |
+              ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
+              ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  igPopStyleVar(1);
+  ui_theme_transition_begin(env);
+  switch (usr->gdata.curr_screen) {
+    case TITLE_SCREEN:
+      // Home/Social are fully opaque Compose. Paper Skin punches a hole in
+      // the preview card and asks for the two-row snake here, without
+      // switching to SKIN_EDITOR (that path is the dark nested editor).
+      if (ui_skin_editor_postcard()) ui_skin_editor(env);
+      break;
+    case LOBBY:
+      ui_lobby(env);
+      break;
+    case SKIN_EDITOR:
+      ui_skin_editor(env);
+      break;
+    case PLAYING:
+      game_loop(env);
+      break;
+  }
+  ui_theme_transition_end(env);
+  if (gdata->curr_screen == PLAYING && android_home_death_pending()) {
+    ImGuiViewport* viewport = igGetMainViewport();
+    ImVec2 end = {viewport->Pos.x + viewport->Size.x,
+                  viewport->Pos.y + viewport->Size.y};
+    unsigned alpha = (unsigned)(255 * (1 - android_home_death_opacity()));
+    ImDrawList_AddRectFilled(igGetForegroundDrawList_ViewportPtr(viewport),
+        viewport->Pos, end, alpha << 24, 0, 0);
+  }
+  igEnd();
+  // render end
+
+  igRender();
+  bool draw = !wyrm_background() && wyrm_engine_visible(env);
+  if (draw && tcontext_begin(ctx)) {
+    // On the Compose-owned screens this clear *is* the background the player
+    // sees: the interface above it is transparent so the skin preview and the
+    // accessory sprites can show through, so it has to be Wyrm's black rather
+    // than the engine's old slate.
+    // Also while connecting: the loading screen is Wyrm's, not the arena's.
+    bool compose_owns = usr->gdata.curr_screen == TITLE_SCREEN ||
+                        usr->gdata.curr_screen == SKIN_EDITOR;
+    bool title = usr->gdata.curr_screen == TITLE_SCREEN;
+    bool wyrm_black = (compose_owns && !title) ||
+                      usr->gdata.curr_screen == LOBBY ||
+                      usr->gdata.conn == CONNECTING;
+    vec4 clear_color = {0.086f, 0.109f, 0.133f, 1};
+    if (title) {
+      /* Paper #F7F6F3 under Compose Home/Auth and the Skin postcard hole. */
+      clear_color[0] = 0.969f;
+      clear_color[1] = 0.965f;
+      clear_color[2] = 0.953f;
+    } else if (wyrm_black) {
+      clear_color[0] = 0.035f;
+      clear_color[1] = 0.035f;
+      clear_color[2] = 0.035f;
+    }
+    renderer_render(usr->r, ctx, clear_color);
+    tcontext_clear(ctx, (vec4){0, 0, 0, 1.0f});
+    imgui_render(ctx->frames[ctx->current_frame].cmd);
+    renderer_render_cursor(usr->r, ctx);
+    tcontext_end(ctx);
+  }
+  renderer_clear_instances(usr->r);
+#if defined(__ANDROID__) || defined(WYRM_DESKTOP)
+  wyrm_pace(draw);
+#endif
+}
+
+/**
+ * Called for every frame the window gives up on drawing.
+ *
+ * Rotating into a match is not one skipped frame. `twindow` returns early for
+ * each swapchain rebuild, and asks for another whenever the driver hands back
+ * an extent that still describes the display as it was before the rotation —
+ * which is exactly what happens on the way from portrait Home into a landscape
+ * arena. `trender` does not run on any of those frames, and `server_poll` lives
+ * inside it, so for the whole rotation the arena socket is not read, not
+ * written, and not answered.
+ *
+ * Everything that looked like three separate faults came from that one gap: the
+ * arena's ping reply sat unread so the keepalive stalled and the arena closed
+ * an idle snake at around 0.7s; the updates that queued up in the meantime all
+ * arrived at once, so the snake appeared mid-flight as though the match had
+ * started without us; and the reply that was finally read had been waiting the
+ * length of the rotation, which is the 200ms-odd that settles by itself a
+ * moment later.
+ *
+ * So the socket is pumped here. This is the one place that knows a frame is
+ * being skipped rather than merely running slowly.
+ */
+void tresize(tenv* env) {
+  ui_viewport_resize(env);
+  /* A new swapchain starts empty: give it the settle frames again. */
+  wyrm_settle = WYRM_SETTLE_FRAMES;
+#if defined(__ANDROID__) || defined(WYRM_DESKTOP)
+  /* This rebuild used the current present mode. */
+  wyrm_present_pending = 0;
+#endif
+  /* Only once an arena socket exists: the manager is initialised with the game
+   * and these callbacks also run during startup. */
+  if (env->usr && env->usr->gdata.connection) server_poll(env);
+}
+
+TDEF_ENTRY();

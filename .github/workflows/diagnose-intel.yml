@@ -36,7 +36,7 @@ jobs:
           from pathlib import Path
           with Path('dist/lldb.log').open('w') as output:
               try:
-                  subprocess.run(['lldb', '--batch', '-o', 'run', '-o', 'thread backtrace all', '--',
+                  subprocess.run(['lldb', '--batch', '-k', 'thread backtrace all', '-o', 'run', '--',
                                   'build/Wyrm.app/Contents/MacOS/Wyrm', '--smoke-ai'],
                                  stdout=output, stderr=subprocess.STDOUT, timeout=90)
               except subprocess.TimeoutExpired:

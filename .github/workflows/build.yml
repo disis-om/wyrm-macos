@@ -45,7 +45,7 @@ jobs:
         run: |
           mkdir -p build
           ditto -x -k downloaded/Wyrm-macOS-universal.zip build
-          lipo -verify_arch arm64 build/Wyrm.app/Contents/MacOS/Wyrm
+          lipo build/Wyrm.app/Contents/MacOS/Wyrm -verify_arch arm64
       - name: Hosted Apple Silicon offline AI smoke
         continue-on-error: true
         run: python3 Scripts/smoke.py

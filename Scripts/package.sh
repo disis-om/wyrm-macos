@@ -4,8 +4,8 @@ cd "$(dirname "$0")/.."
 APP=build/Wyrm.app
 mkdir -p dist
 python3 Scripts/verify-bundle.py
-lipo -verify_arch x86_64 arm64 "$APP/Contents/MacOS/Wyrm"
-lipo -verify_arch x86_64 arm64 "$APP/Contents/Frameworks/SDL3.framework/SDL3"
+lipo "$APP/Contents/MacOS/Wyrm" -verify_arch x86_64 arm64
+lipo "$APP/Contents/Frameworks/SDL3.framework/SDL3" -verify_arch x86_64 arm64
 otool -L "$APP/Contents/MacOS/Wyrm" | tee dist/dependencies.txt
 if grep -E '/Users/|/opt/homebrew|/usr/local|libjvm' dist/dependencies.txt; then
   echo 'Non-bundled dependency detected' >&2; exit 1

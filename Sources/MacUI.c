@@ -43,7 +43,7 @@ void wyrm_mac_ui(tenv* env) {
   float width = fminf(560, vp->Size.x - 40);
   igSetNextWindowPos((ImVec2){vp->Size.x * .5f, vp->Size.y * .5f},
                     ImGuiCond_Always, (ImVec2){.5f, .5f});
-  igSetNextWindowSize((ImVec2){width, 0}, ImGuiCond_Always);
+  igSetNextWindowSize((ImVec2){width, home ? fminf(720, vp->Size.y - 40) : 0}, ImGuiCond_Always);
   igPushStyleVar_Vec2(ImGuiStyleVar_WindowPadding, (ImVec2){32, 28});
   igPushStyleVar_Vec2(ImGuiStyleVar_ItemSpacing, (ImVec2){12, 14});
   igPushStyleVar_Vec2(ImGuiStyleVar_FramePadding, (ImVec2){12, 10});
@@ -55,7 +55,8 @@ void wyrm_mac_ui(tenv* env) {
   igPushStyleColor_Vec4(ImGuiCol_Button, (ImVec4){.30f,.50f,.32f,1});
   igPushStyleColor_Vec4(ImGuiCol_ButtonHovered, (ImVec4){.42f,.64f,.42f,1});
   igPushStyleColor_Vec4(ImGuiCol_ButtonActive, (ImVec4){.24f,.42f,.26f,1});
-  igBegin("Wyrm for Mac", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+  igBegin("Wyrm for Mac", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove |
           ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
   igPushFont(user->imgui_data.body_font[0], 18);
   igPushFont(user->imgui_data.display_font[1], 32);

@@ -22,6 +22,8 @@ hosted Intel Metal 2 driver. Native smoke tests run as separate, failing jobs
 on both architectures; compile success cannot hide a runtime failure.
 The macOS launcher draws with the engine's existing Dear ImGui and packaged
 Wyrm fonts: restrained paper/ink composition, green Play accent, no web view.
+The launcher is bounded by the current viewport and scrolls on small windows;
+Play and custom endpoints stay reachable on scaled laptop displays.
 Play posts into the engine's bounded home mailbox. No game objects cross threads.
 
 The first-stage adapter leaves the original JNI-exported entrypoints compiled

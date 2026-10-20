@@ -29,3 +29,6 @@ launch, online join, sustained play and Hackintosh drivers remain unverified.
 
 - 2026-10-20 — Began Desktop-engine macOS bring-up at OM's request; universal
   macOS 12 target, session-only minimal launcher and explicit generated adapters.
+- 2026-10-20 — Traced Intel startup abort to the Metal argument-encoder probe;
+  ordinary bindings pass the hosted Intel AI check. Added strict native CI jobs
+  and a scrolling launcher for scaled laptop windows; final package in progress.

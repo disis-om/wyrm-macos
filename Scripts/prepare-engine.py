@@ -30,6 +30,15 @@ patch('thermite/src/graphics/tcontext.c', 'vkCreateDevice(', 'wyrm_mac_create_de
 patch('thermite/src/framework/twindow.c',
       'SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE',
       'SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE')
+patch('thermite/src/framework/twindow.c', '    case SDL_EVENT_QUIT:',
+      '    case SDL_EVENT_WINDOW_FOCUS_LOST:\n'
+      '      memset(desktop_held, 0, sizeof(desktop_held));\n'
+      '      break;\n    case SDL_EVENT_QUIT:')
+patch('app/src/mobile/mobile_controls.c',
+      '  if (ai_mode_notice_process_event(env, raw_event)) return true;',
+      '  if (event->type == SDL_EVENT_WINDOW_FOCUS_LOST) {\n'
+      '    reset_touches(state);\n    return false;\n  }\n'
+      '  if (ai_mode_notice_process_event(env, raw_event)) return true;')
 # Use 1:1 window pixels in this bring-up, avoiding logical/pixel pointer mismatch.
 patch('thermite/src/framework/twindow.c', '(void)window;\n#elif defined(WYRM_SDL_JNI)',
       'bool on = !(SDL_GetWindowFlags(window->handle) & SDL_WINDOW_FULLSCREEN);\n'

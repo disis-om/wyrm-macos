@@ -18,7 +18,8 @@ Read ../CLAUDE.md and the workspace Desk first. Owner: OM Rajput.
 ## Current state
 
 2026-10-20: public repo disis-om/wyrm-macos created and pushed. Initial universal
-compile reached the host; missing SDL_main declaration fixed. Cloud verification in progress. Physical
+compile completed for both architectures after fixing the SDL_main declaration.
+Packaging/runtime checks in progress; focus release and bundle inspection added. Physical
 launch, online join, sustained play and Hackintosh drivers remain unverified.
 
 ## Log

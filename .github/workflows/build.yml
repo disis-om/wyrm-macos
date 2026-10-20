@@ -31,3 +31,26 @@ jobs:
           name: Wyrm-macOS-universal
           path: dist/
           retention-days: 30
+  apple-silicon:
+    needs: universal
+    runs-on: macos-15
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: Wyrm-macOS-universal
+          path: downloaded
+      - name: Unpack shipped app
+        run: |
+          mkdir -p build
+          ditto -x -k downloaded/Wyrm-macOS-universal.zip build
+          lipo -verify_arch arm64 build/Wyrm.app/Contents/MacOS/Wyrm
+      - name: Hosted Apple Silicon offline AI smoke
+        continue-on-error: true
+        run: python3 Scripts/smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wyrm-Apple-Silicon-smoke
+          path: dist/
+          retention-days: 30

@@ -4,3 +4,4 @@ Vendor/
 dist/
 .DS_Store
 *.user
+__pycache__/

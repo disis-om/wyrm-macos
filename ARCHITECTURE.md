@@ -13,6 +13,8 @@ SDL3 owns the visible, resizable window and main-thread event loop. The original
 Vulkan renderer presents directly through MoltenVK; Windows CPU readback is
 disabled. Portability extensions are enabled when advertised, using the proven
 iOS Apple Vulkan adapter. Desktop mouse/keyboard semantics stay selected.
+Focus loss releases the native held-key map and pointer state, so switching
+away cannot leave boost or a turn held down.
 The macOS launcher draws with the engine's existing Dear ImGui and packaged
 Wyrm fonts: restrained paper/ink composition, green Play accent, no web view.
 Play posts into the engine's bounded home mailbox. No game objects cross threads.
@@ -42,5 +44,8 @@ An offline-only `--smoke-ai` check opens the actual engine, dismisses the practi
 notice through an SDL Enter event, and requires 120 presented AI frames, snakes
 and no network socket. Hosted graphics failures are retained as separate evidence;
 they do not turn a successful compile into a false gameplay claim.
+The packaged app is also opened on a standard Apple Silicon runner. Both hosts
+retain separate smoke logs; the universal binary and bundled SDL framework have
+their real Mach-O architecture slices and minimum macOS versions inspected.
 No Apple signing secrets or backend credentials are required. CI is build proof;
 Intel and Apple Silicon physical gameplay are separate pending verification.

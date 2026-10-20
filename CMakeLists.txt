@@ -39,7 +39,8 @@ target_link_libraries(Wyrm PRIVATE "${SDL_FRAMEWORK}" "${MVK_LIBRARY}"
 # SDL discovers the statically linked Vulkan entrypoint via dlsym.
 target_link_options(Wyrm PRIVATE -Wl,-export_dynamic -Wl,-u,_vkGetInstanceProcAddr)
 set_target_properties(Wyrm PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/Sources/Info.plist"
-  BUILD_RPATH "@executable_path/../Frameworks" INSTALL_RPATH "@executable_path/../Frameworks")
+  BUILD_RPATH "@executable_path/../Frameworks" INSTALL_RPATH "@executable_path/../Frameworks"
+  BUILD_WITH_INSTALL_RPATH TRUE)
 add_custom_command(TARGET Wyrm POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:Wyrm>/Contents/Frameworks"
   COMMAND ditto "${SDL_FRAMEWORK}" "$<TARGET_BUNDLE_DIR:Wyrm>/Contents/Frameworks/SDL3.framework"

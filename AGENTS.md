@@ -17,13 +17,21 @@ Read ../CLAUDE.md and the workspace Desk first. Owner: OM Rajput.
 
 ## Current state
 
-2026-10-20: public repo disis-om/wyrm-macos created and pushed. Initial universal
-compile completed for both architectures after fixing the SDL_main declaration.
-Bundle/signature/minimum-OS checks passed. Apple Silicon completed 120 presented
-offline AI frames. Intel hit a MoltenVK argument-encoder probe abort; compatible
-ordinary binding mode is under verification. Native test failures now fail CI.
-Physical
-launch, online join, sustained play and Hackintosh drivers remain unverified.
+2026-10-20: public repo disis-om/wyrm-macos, development 0.1.0 (1) delivered as
+an Actions artifact (no beta/stable release). Run 39463554764, source 01fb58d:
+universal compile, bundle, ad-hoc signature and actual macOS 12 minimum checks
+passed. The shipped ZIP passed native offline AI on both Intel and Apple Silicon:
+120 presented frames each, snakes present, no socket, clean exit. ZIP hash and
+download are in README. The Intel Metal argument-encoder abort is fixed by
+disabling unnecessary argument buffers before Vulkan startup. Native failures
+fail CI. Physical launch/input/visual review, online join, sustained play,
+macOS 12 runtime and Hackintosh drivers remain unverified; OM tests his T480s.
+
+Account check for this build: name, arena and engine settings are session-only;
+there is no account save/restore or persistent platform/shared document yet.
+Existing schema/protocol are unchanged, so no migration is introduced. Full
+account integration must use macos and the existing shared keys before adding
+persistent settings. No production backend changes.
 
 ## Log
 
@@ -32,3 +40,6 @@ launch, online join, sustained play and Hackintosh drivers remain unverified.
 - 2026-10-20 — Traced Intel startup abort to the Metal argument-encoder probe;
   ordinary bindings pass the hosted Intel AI check. Added strict native CI jobs
   and a scrolling launcher for scaled laptop windows; final package in progress.
+- 2026-10-20 — Final run 39463554764 passed universal packaging and strict native
+  Intel/Apple Silicon offline AI checks. Downloaded ZIP checksum verified;
+  development artifact delivered, physical and online tests remain pending.

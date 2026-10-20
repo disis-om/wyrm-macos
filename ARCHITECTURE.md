@@ -36,7 +36,7 @@ failures display a native alert. Death/retry/leave route through engine commands
 
 Bundle Resources contains app/res. The process starts from Resources so original
 relative paths remain valid. Engine user.dat/temp/backup paths resolve to a
-fresh session temp directory, removed at exit; no persistent setting bypasses
+fresh session temp directory, removed at normal exit; no persistent setting bypasses
 the account registry. Launcher name and arena are also session-only. Account
 save/restore and macos/shared document integration are explicitly pending.
 The live directory uses the same rolling nibble decoder and record layouts as
@@ -56,3 +56,13 @@ retain separate smoke logs; the universal binary and bundled SDL framework have
 their real Mach-O architecture slices and minimum macOS versions inspected.
 No Apple signing secrets or backend credentials are required. CI is build proof;
 Intel and Apple Silicon physical gameplay are separate pending verification.
+
+## Verified development artifact (2026-10-20)
+
+Run 39463554764 built source 01fb58d. The same packaged universal ZIP was
+extracted and launched on native x86_64 and arm64 hosted Macs; each passed
+120 AI presentations, snakes present, no arena socket and clean teardown.
+Both used ordinary resource indexes after the compatibility fix. Mac OS minimum
+metadata is 12.0 for both executable slices. README records the download/hash.
+The original 475-file transport hash check also passed. These results do not
+prove online joining, physical controls, sustained play or macOS 12 runtime.

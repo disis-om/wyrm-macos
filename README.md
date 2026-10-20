@@ -7,6 +7,22 @@ engine compiled by Wyrm Desktop, SDL3 and Vulkan through MoltenVK.
 Public source: https://github.com/disis-om/wyrm-macos. Cloud builds use standard
 hosted Mac runners; no paid larger runners or signing services are configured.
 
+## Development download — 0.1.0 (1)
+
+[Download the universal test artifact](https://github.com/disis-om/wyrm-macos/actions/runs/39463554764/artifacts/12283773018)
+(sign in to download; retained for 30 days). Inside the artifact, extract
+`Wyrm-macOS-universal.zip` to get `Wyrm.app`.
+
+[Build and native checks](https://github.com/disis-om/wyrm-macos/actions/runs/39463554764),
+source `01fb58d0e18800d0667dcea25f14a5aacb7af573`: universal compile, actual
+macOS 12 minimum metadata, bundled dependencies and ad-hoc signatures verified.
+The packaged app ran offline AI for 120 presented frames and exited cleanly
+on both hosted Intel and Apple Silicon Macs. Online arena entry, minimum-OS
+runtime, physical input/visual review and T480s gameplay remain unverified.
+
+ZIP SHA-256:
+`94855fce838e16f62b56c2aa7af07dabddbe9355144b11ccf09c12d002a53517`.
+
 This prototype provides a live arena directory, custom endpoint, player name,
 Play and offline AI. Mouse steers; click/Space boosts, P toggles assist,
 Q leaves, F11 toggles fullscreen. Home/Play again remain available after death.

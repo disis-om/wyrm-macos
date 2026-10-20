@@ -1,0 +1,35 @@
+name: Intel graphics diagnosis
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Universal artifact run
+        default: '39461836020'
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  graphics:
+    runs-on: macos-15-intel
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: Wyrm-macOS-universal
+          path: downloaded
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Unpack test app
+        run: |
+          mkdir -p build
+          ditto -x -k downloaded/Wyrm-macOS-universal.zip build
+      - name: Diagnose startup
+        run: python3 Scripts/smoke.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Intel-startup-diagnostics
+          path: dist/
+          retention-days: 7

@@ -49,7 +49,10 @@ patch('app/src/main.c', 'TDEF_ENTRY();',
 patch('app/src/main.c', '  ui_theme_transition_end(env);',
       '  ui_theme_transition_end(env);\n  wyrm_mac_ui(env);')
 patch('app/src/main.c', 'bool draw = !wyrm_background() && wyrm_engine_visible(env);',
-      'bool draw = !wyrm_background(); /* Native launcher also needs presentation. */')
+      'bool draw = !wyrm_background() && wyrm_mac_engine_visible(env); /* MacUI.c */')
+# Not drawing (under the AppKit shell), the pass also pumps AppKit's events:
+# 8 ms keeps dragging and typing smooth (Android/Desktop idle at 25 ms).
+patch('app/src/main.c', '#define WYRM_IDLE_MS 25', '#define WYRM_IDLE_MS 8')
 patch('app/src/game/ui_overlay.c', '#ifdef WYRM_DESKTOP\n        /* Draw the line',
       '#if defined(WYRM_DESKTOP) && !defined(WYRM_MACOS)\n        /* Draw the line')
 patch('app/src/platform/android_home.c',

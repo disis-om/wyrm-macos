@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-VENDOR_DIR="$ROOT_DIR/Vendor"
+# exFAT cannot hold framework symlinks: point WYRM_VENDOR_DIR at native storage.
+VENDOR_DIR="${WYRM_VENDOR_DIR:-$ROOT_DIR/Vendor}"
 WORK_DIR="$(mktemp -d)"
 SDL_MOUNT="$WORK_DIR/sdl-volume"
 
